@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cyt-pymapper"
+version = "0.1.0"
+description = "XML SQL mapper and implicit AsyncSession transaction runtime for CYT services"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "Jinja2>=3.1,<4",
+  "SQLAlchemy[asyncio]>=2.0,<3",
+]
+
+[project.optional-dependencies]
+# 包测试自带依赖声明: 换个环境跑 tests/ 不再靠宿主项目碰巧装了 pytest-asyncio
+test = [
+  "pytest>=8",
+  "pytest-asyncio>=1.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# py.typed 必须随 wheel 分发: 缺了它, 消费项目的 pyright/mypy 视本包为无类型,
+# 全部导出退化成 Unknown(Buyer 自己感知不到 —— 它的 pyrightconfig extraPaths 直指 src)。
+[tool.setuptools.package-data]
+cyt_pymapper = ["py.typed"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
