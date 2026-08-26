@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cyt-pymapper"
-version = "0.1.0"
-description = "XML SQL mapper and implicit AsyncSession transaction runtime for CYT services"
+version = "0.2.0"
+description = "PostgreSQL XML mapper with asyncpg pooling and implicit transactions"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
   "Jinja2>=3.1,<4",
-  "SQLAlchemy[asyncio]>=2.0,<3",
+  "asyncpg>=0.31,<1",
 ]
 
 [project.optional-dependencies]

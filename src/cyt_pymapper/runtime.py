@@ -1,14 +1,10 @@
-"""XML mapper 执行内核 —— "XML + jinja2 动态 SQL"模式(仿 MyBatis), 跑在项目 async 栈上。
+"""XML mapper execution runtime backed directly by asyncpg.
 
 对外 API 从 `cyt_pymapper` 导入(本模块是实现)。
 
-与 batisx 的差异(解决同步断层):
-- 执行走 SQLAlchemy AsyncSession(asyncpg): 复用现有引擎/读写分离/事务/pytest 体系, 无第二套连接池
-- XML 里的 :name 命名参数与 SQLAlchemy text() 语法天然一致, 零转换
-- list/tuple/set 参数自动 expanding bindparam → `IN :names` 直接可用
-- 约定与 batisx 相同: jinja2 只控制 SQL 结构({% if %}), 值一律走 :name 绑参, 禁止 {{ 值 }} 渲染
-
-依赖(Jinja2 / SQLAlchemy[asyncio])由本包 pyproject 声明, 消费项目 pip install 即得。
+XML keeps readable ``:name`` parameters. They are compiled to asyncpg ``$1``
+parameters after Jinja has selected SQL structure. Collection parameters retain
+the established ``IN :names`` expansion behavior.
 """
 from __future__ import annotations
 
@@ -17,15 +13,16 @@ import inspect
 import re
 import threading
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
 from jinja2 import Environment, Template, meta
-from sqlalchemy import CursorResult, bindparam, text
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from cyt_pymapper import mapping as result_mapping
-from cyt_pymapper.base import MapperBase, clear_session_factory
+from cyt_pymapper.base import MapperBase
+from cyt_pymapper.compiler import compile_query, contains_sql_keyword, named_parameter_names
+from cyt_pymapper.database import ConnectionLike
 
 validate_result_types = result_mapping.validate_result_types
 
@@ -39,6 +36,7 @@ _NS_METHODS: dict[str, tuple[str, set[str]]] = {}
 # full_id → XML 命名绑参 / Mapper 声明参数。契约只校验到 Mapper, 不追踪上层调用方。
 _BIND_VARS: dict[str, set[str]] = {}
 _METHOD_PARAMS: dict[str, set[str]] = {}
+_STATEMENT_KINDS: dict[str, str] = {}
 _DecoratedT = TypeVar("_DecoratedT")
 _MAPPER_PATHS: tuple[Path, ...] = ()
 # "配置的全部路径已完整加载"的显式标志。⚠ 不能拿 _SQL_CONTAINER 非空当这个判据:
@@ -47,16 +45,7 @@ _MAPPER_PATHS: tuple[Path, ...] = ()
 _FULLY_LOADED = False
 
 
-# SQL 里的 :name 占位。⚠ 必须与 SQLAlchemy 的 TextClause._bind_params_regex 逐字对齐 ——
-# _verify_bind_contract 拿它当"SQLAlchemy 会绑哪些参数"的判据, 两边不一致就是假阳性/假阴性:
-#   前置 (?<![:\w\\]) 是关键: 冒号前是字母数字时不算绑参, 所以 to_char(t,'HH24:MI') 的 :MI
-#   不会被误判(实测 SQLAlchemy 同样不认它) —— 少了这条前置守卫, 这种 SQL 会在加载期被误拒。
-#   后置 (?!:) 让 :name::type 不算绑参, 与 SQLAlchemy 一致(该写法由 _reject_cast_suffix 单独拦)。
-# 对齐性由 tests/test_mapper_runtime.py 的交叉比对测试钉住, 防 SQLAlchemy 升级后静默漂移。
-_NAMED_PARAM = re.compile(r"(?<![:\w\\]):(\w+)(?!:)")
-
-# :name::type —— SQLAlchemy 不把它当绑参, 会把 ":name::type" 原样发给 PG 换来一个语法错误。
-# 属于"加载能过、一跑就炸", 加载期拦掉并给出改写方案。
+# Keep casts explicit so named-parameter parsing remains unambiguous.
 _CAST_SUFFIX_PARAM = re.compile(r"(?<![:\w\\]):(\w+)::")
 
 # jinja2 值插值 {{ ... }} —— 实测确认是 SQL 注入口(值被直接拼进 SQL, 完全绕过绑参),
@@ -109,7 +98,7 @@ def load_all_mappers() -> int:
             return len(_SQL_CONTAINER)
         if not _MAPPER_PATHS:
             raise RuntimeError(
-                "cyt-pymapper is not configured: call configure(session_factory=..., mapper_paths=...)"
+                "cyt-pymapper is not configured: call configure(database_url=..., mapper_paths=...)"
             )
         _clear_loaded_sql()
         try:
@@ -126,10 +115,10 @@ def load_all_mappers() -> int:
 
 
 def reset_state() -> None:
-    """Reset every framework registry plus the bound session factory and mapper paths.
+    """Reset mapper registries and configured XML paths.
 
-    这是测试隔离与热加载的**唯一**公开入口 —— 别再让每个消费项目的 conftest 手动清
-    九个内部 dict(加第十个注册表时所有拷贝一起过期)。
+    数据库池拥有独立的异步生命周期，不能由同步的 mapper 重置函数关闭或清空；调用方
+    必须先 await close_database()，确有需要时再清数据库配置。
     ⚠ 已被 @amapper 装饰的类不受影响: wrapper 闭包与其"首次调用已校验"标记都还在。
       reset 后若 XML 契约变了, 需要重新 import(重新装饰)mapper 类才能重跑校验。
     """
@@ -139,7 +128,6 @@ def reset_state() -> None:
         _METHOD_PARAMS.clear()
         global _MAPPER_PATHS
         _MAPPER_PATHS = ()
-        clear_session_factory()
 
 
 def _clear_loaded_sql() -> None:
@@ -151,6 +139,7 @@ def _clear_loaded_sql() -> None:
     _JINJA_VARS.clear()
     result_mapping.clear_result_mappings()
     _BIND_VARS.clear()
+    _STATEMENT_KINDS.clear()
 
 
 def load_mapper(path: str | Path) -> None:
@@ -197,13 +186,14 @@ def load_mapper(path: str | Path) -> None:
             _reject_interpolation(full_id, sql, file)
             _reject_cast_suffix(full_id, sql, file)
             _SQL_CONTAINER[full_id] = Template(sql)
+            _STATEMENT_KINDS[full_id] = child.tag.lower()
             result_mapping.load_result_spec(namespace, full_id, child, file)
             # 模板里 {% if xxx %} 引用的变量名(不含 :name 绑参) —— 首次调用时与方法签名比对,
             # 抓"XML 写了签名没声明的名字"这类拼写错。
             # ⚠ 不用 StrictUndefined 实现: 它会让 render_sql() 这个调试/自省入口无法只传部分参数,
             #   而且拦不住 `x is not none`(identity 测试不触发 Undefined 报错)。
             _JINJA_VARS[full_id] = meta.find_undeclared_variables(_JINJA_ENV.parse(sql))
-            _BIND_VARS[full_id] = set(_NAMED_PARAM.findall(sql))
+            _BIND_VARS[full_id] = named_parameter_names(sql)
             _verify_bind_contract(full_id)
 
         # 该 namespace 的 Mapper 类若已 import, 立刻做双向对齐(见 _verify_namespace)
@@ -247,14 +237,13 @@ def _reject_interpolation(full_id: str, sql: str, file: Path) -> None:
 
 
 def _reject_cast_suffix(full_id: str, sql: str, file: Path) -> None:
-    """加载期拦截 `:name::type` —— SQLAlchemy 不认这种绑参, 会把它原样发给 PG 换一个语法错误。"""
+    """Require ``CAST(:name AS type)`` instead of ambiguous suffix casts."""
     hits = sorted(set(_CAST_SUFFIX_PARAM.findall(sql)))
     if not hits:
         return
     raise ValueError(
         f"mapper 条目 '{full_id}' ({file.name}) 写了 {[f':{name}::' for name in hits]} —— "
-        "SQLAlchemy 不把 `:name::type` 当绑参, 这句 SQL 会带着字面量冒号发给 PG。"
-        "改写成 `CAST(:name AS type)`。")
+        "命名参数后直接接 PostgreSQL cast 容易产生解析歧义，改写成 `CAST(:name AS type)`。")
 
 
 def render_sql(full_id: str, **kwargs: Any) -> tuple[str, dict[str, Any]]:
@@ -266,7 +255,7 @@ def render_sql(full_id: str, **kwargs: Any) -> tuple[str, dict[str, Any]]:
             f"@amapper 类的 模块路径.类名.方法名 一致 (已加载 {len(_SQL_CONTAINER)} 条)")
     sql = _SQL_CONTAINER[full_id].render(**kwargs)
     sql = "\n".join(line for line in sql.splitlines() if line.strip())
-    names = set(_NAMED_PARAM.findall(sql))
+    names = named_parameter_names(sql)
     params = {
         parameter_name: parameter_value
         for parameter_name, parameter_value in kwargs.items()
@@ -295,22 +284,52 @@ def _ensure_loaded() -> None:
         raise
 
 
-async def _execute(session: AsyncSession, full_id: str, **kwargs: Any) -> CursorResult[Any]:
-    """渲染 + 绑参 + 执行。返回类型收窄到 CursorResult 这一层, 调用点才能直接用
-    returns_rows / rowcount —— AsyncSession.execute() 声明的是 Result[Any], 那俩属性
-    只在 CursorResult 上有; 本函数只执行 text() 语句, 实际拿到的必然是 CursorResult。"""
+@dataclass(frozen=True, slots=True)
+class ExecutionResult:
+    rows: list[Any] | None
+    rowcount: int
+
+    @property
+    def returns_rows(self) -> bool:
+        return self.rows is not None
+
+
+def _command_rowcount(status: str) -> int:
+    """Extract affected rows from asyncpg command tags such as ``UPDATE 3``."""
+    for token in reversed(status.split()):
+        if token.isdigit():
+            return int(token)
+    return 0
+
+
+async def _execute(
+    connection: ConnectionLike,
+    full_id: str,
+    **kwargs: Any,
+) -> ExecutionResult:
+    """Render, compile and execute one statement on an asyncpg connection."""
     _ensure_loaded()
     sql, params = render_sql(full_id, **kwargs)
-    stmt = text(sql)
-    # IN :names — 集合类参数转 expanding bindparam(asyncpg 下自动展开成多个占位)
-    for key, value in params.items():
-        if isinstance(value, (list, tuple, set)):
-            stmt = stmt.bindparams(bindparam(key, expanding=True))
-            params[key] = list(value)
-    # cast 而非 isinstance 断言: 这里补的是**库的类型标注比实际窄**(execute 声明 Result[Any],
-    # 执行 text() 实得 CursorResult), 不是防数据出错 —— 加运行期 isinstance 等于
-    # 每条查询付一次检查, 还逼所有 mock 测试替身去伪装类型, 收益为零。
-    return cast("CursorResult[Any]", await session.execute(stmt, params))
+    compiled = compile_query(sql, params)
+    statement_kind = _STATEMENT_KINDS.get(full_id)
+    # XML entries carry an explicit statement kind. Directly registered templates
+    # (tests/extensions) do not, so infer only from the first executable keyword;
+    # searching for SELECT anywhere would misclassify INSERT ... SELECT statements.
+    first_keyword = re.match(r"\s*([A-Za-z]+)", sql)
+    returns_rows = (
+        statement_kind == "select"
+        or (
+            statement_kind is None
+            and first_keyword is not None
+            and first_keyword.group(1).upper() in {"SELECT", "SHOW", "VALUES", "EXPLAIN"}
+        )
+        or contains_sql_keyword(sql, "RETURNING")
+    )
+    if returns_rows:
+        rows = list(await connection.fetch(compiled.sql, *compiled.args))
+        return ExecutionResult(rows=rows, rowcount=len(rows))
+    status = await connection.execute(compiled.sql, *compiled.args)
+    return ExecutionResult(rows=None, rowcount=_command_rowcount(status))
 
 
 def _declared_defaults(func) -> dict[str, Any]:
@@ -341,11 +360,10 @@ def _make_wrapper(full_id: str, func, owner: MapperBase | type[MapperBase]):
         # 求值为 True —— 不补全会导致"省略参数"仍渲染出该 SET/WHERE 子句, 但绑参缺失而报错
         # (甚至在 `{% if x %}` 写法下静默生成错 SQL)。补全后 jinja 永远看到显式值。
         merged = {**defaults, **kwargs}
-        async with owner.acquire_session() as session:
-            result = await _execute(session, full_id, **merged)
+        async with owner.acquire_connection() as connection:
+            result = await _execute(connection, full_id, **merged)
             if result.returns_rows:
-                # 在 session 生命周期内取完结果，避免关闭连接后再消费游标。
-                return result_mapping.shape_rows(full_id, list(result.mappings().all()))
+                return result_mapping.shape_rows(full_id, result.rows or [])
             return result.rowcount
     return wrapper
 
@@ -427,7 +445,7 @@ def _check_namespace(namespace: str | None, owner: str) -> str:
 
 
 class AMapper(MapperBase):
-    """Async mapper AOP enhancer backed by ``MapperBase`` session scopes.
+    """Async mapper enhancer backed by implicit asyncpg connections.
 
     挂函数: namespace 缺省 = 模块路径(func.__module__), fullId = 模块.函数名。
     挂类(仿 MyBatis Mapper 接口): namespace 缺省 = 模块路径.类名, 类里所有公开方法
@@ -435,7 +453,7 @@ class AMapper(MapperBase):
     直接 `OrdersRepo.list_xxx(...)` 类级调用, 不需要实例化, 方法签名不写 self/session。
     XML 对应 <mapper namespace="app.repositories.orders_mapper.OrdersMapper">。
 
-    AMapper 继承 MapperBase；被装饰的业务 Mapper 只声明接口，不持有 session。
+    AMapper 继承 MapperBase；被装饰的业务 Mapper 只声明接口，不持有连接。
     SELECT 返回 list[RowMapping](dict 风格行); 其他语句返回受影响行数。
     ⚠ 直接运行的脚本里 __module__ 是 "__main__", mapper 必须定义在可 import 的模块里。
 
@@ -504,6 +522,8 @@ amapper = AMapper
 
 async def scalar(namespace_sql_id: str, **kwargs: Any) -> Any:
     """便捷标量查询(如 count): 返回首行首列。"""
-    async with MapperBase.acquire_session() as session:
-        result = await _execute(session, namespace_sql_id, **kwargs)
-        return result.scalar_one()
+    async with MapperBase.acquire_connection() as connection:
+        result = await _execute(connection, namespace_sql_id, **kwargs)
+        if not result.rows:
+            raise LookupError(f"mapper 标量查询 '{namespace_sql_id}' 没有返回行")
+        return next(iter(dict(result.rows[0]).values()))

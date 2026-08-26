@@ -1,11 +1,13 @@
 # cyt-pymapper
 
-Internal PostgreSQL-first XML mapper runtime for async SQLAlchemy services.
+Internal PostgreSQL-first XML mapper runtime backed directly by asyncpg.
 
 ## Package layout
 
-- `base.py`: implicit session and transaction boundary, corresponding to MyBatis
-  `SqlSession` plus Spring-style transaction propagation.
+- `database.py`: asyncpg pool configuration, startup, shutdown, and connection checkout.
+- `extension.py`: application bootstrap, mapper-package scanning and pool lifespan.
+- `base.py`: implicit connection and transaction propagation.
+- `compiler.py`: safe `:name` to `$1` compilation and collection expansion.
 - `mapping.py`: `resultType`/`resultMap`, model validation, row materialization, and
   strict 0..1 cardinality.
 - `errors.py`: public framework exception hierarchy.
@@ -19,21 +21,34 @@ imports and shared global state spread across several files.
 
 ## Application setup
 
+推荐使用扩展完成一次性接线：
+
 ```python
+from contextlib import asynccontextmanager
 from pathlib import Path
 
-from cyt_pymapper import configure, load_all_mappers
-from myapp.db import WriteSession   # 项目自己的 async_sessionmaker
+from fastapi import FastAPI
+from cyt_pymapper import PyMapperExtension
 
-configure(
-    session_factory=WriteSession,
+pymapper = PyMapperExtension(
+    database_url="postgresql://user:password@localhost/database",
     mapper_paths=[Path(__file__).resolve().parent / "mapper"],
+    mapper_packages=["app.repositories"],
 )
-load_all_mappers()
+
+# 包本身不依赖 FastAPI，同一个 lifespan 也可嵌入其他 ASGI 框架。
+@asynccontextmanager
+async def lifespan(app):
+    async with pymapper.lifespan() as state:
+        print(state.statement_count)
+        yield
+
+app = FastAPI(lifespan=lifespan)
 ```
 
-`configure()` 可重复调用(测试常用);重新配置会清掉已加载的 SQL,下次
-`load_all_mappers()` 按新路径重载。测试隔离用 `reset_state()`,不要手动清内部注册表。
+扩展会自动导入 `mapper_packages` 下的全部模块、加载 XML、执行启动期契约校验、
+打开连接池并在退出时关闭。需要底层接线时仍可使用 `configure()`、
+`load_all_mappers()` 和 `open_database()`。测试隔离用 `reset_state()`，不要手动清注册表。
 
 ## Mapper declaration
 
@@ -52,12 +67,13 @@ async def update_order(order_id: int) -> None:
     await OrdersMapper.add_log(order_id=order_id)
 ```
 
-Mapper methods do not accept a session. A direct mapper call owns one short database
-unit of work. Calls inside `@transactional()` reuse the task-local session and commit
-or roll back together. `REQUIRED` and `REQUIRES_NEW` propagation are supported;
+Mapper methods do not accept a connection. A direct mapper call borrows one connection
+without opening an explicit transaction; PostgreSQL commits that statement as its own
+transaction. Calls inside `@transactional()` reuse the task-local connection and commit or
+roll back together. `REQUIRED` and `REQUIRES_NEW` propagation are supported;
 `REQUIRED` 加入即继承外层事务的隔离级别(与 Spring/MyBatis 同语义)。
 
-Jinja blocks may control SQL structure, but values must use SQLAlchemy named binds
+Jinja blocks may control SQL structure, but values must use named binds
 such as `:order_id`. `{{ value }}` interpolation is rejected while loading XML.
 
 ## Result mapping
@@ -78,14 +94,14 @@ from cyt_pymapper import PyMapperError, TooManyResultsError
 
 ## 已知坑(写代码前读一遍)
 
-- **空集合 expanding 绑参静默匹配零行**: `IN :ids` 传空 list 时, SQLAlchemy 渲染成
+- **空集合 expanding 绑参静默匹配零行**: `IN :ids` 传空 list 时, pymapper 渲染成
   "空集"表达式 —— 不报错、匹配不到任何行。`NOT IN :ids` 传空同理会**排除不了任何行
   之外的东西**(即全部通过)。集合可能为空时, 调用方自己分支或给参数设不可省略的默认。
 - **结果集全量物化**: mapper 调用把整个结果集一次拉进内存再做行映射。大集合一律
   LIMIT/分页, 不要指望流式 —— 框架刻意不提供(避免把游标生命周期泄给调用方)。
 - **事务范围内禁止 `asyncio.create_task` 调 mapper**: 子任务会并发使用同一个连接
-  (asyncpg 直接报错)或用已关闭的 session。见 `transactional` docstring。
-- **`:name::type` 写法加载期即拒**: SQLAlchemy 不认, 改写 `CAST(:name AS type)`。
+  (asyncpg 直接报错)或使用已释放的连接。见 `transactional` docstring。
+- **`:name::type` 写法加载期即拒**: 改写 `CAST(:name AS type)`。
 
 ## Tests
 

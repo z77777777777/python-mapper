@@ -3,20 +3,22 @@
 这批测试是包的免疫系统, 必须随包走(而不是留在某个消费项目里):
 - 事务边界: 直调自管短事务 / REQUIRED 共享回滚 / REQUIRES_NEW 独立提交
 - 加载期契约: {{ 值 }} 注入拦截 / :name::type 拦截 / 绑参契约 / XML id 校验
-- _NAMED_PARAM 与 SQLAlchemy 私有解析的交叉比对 —— SQLAlchemy 升级改了绑参规则时,
-  先炸这里而不是炸生产 SQL(runtime.py 里 _NAMED_PARAM 的注释指名靠本文件钉住)。
+- asyncpg 位置参数编译与 SQL 词法边界，确保字符串、注释和 PostgreSQL cast 不被误判。
 """
 from __future__ import annotations
 
+import importlib
+import json
 from dataclasses import dataclass
 
 import pytest
 from cyt_pymapper import (
+    PyMapperExtension,
     TooManyResultsError,
     amapper,
-    base,
     configure,
-    current_session,
+    current_connection,
+    database,
     load_all_mappers,
     load_mapper,
     reset_state,
@@ -24,9 +26,9 @@ from cyt_pymapper import (
     transactional,
 )
 from cyt_pymapper import mapping as result_mapping
+from cyt_pymapper.compiler import compile_query, named_parameter_names
 from cyt_pymapper.errors import TooManyResultsError as ErrorsModuleTooManyResultsError
 from cyt_pymapper.runtime import _reject_interpolation
-from sqlalchemy import text
 
 # 快照/还原要覆盖的全部注册表 —— 与 reset_state 清的范围一致。
 # fixture 用"快照→reset→跑→reset→还原"而不是清空了事: 这样本测试文件可以混在
@@ -34,7 +36,7 @@ from sqlalchemy import text
 # mapper 状态原样回来, 不会把后面的业务测试炸成"未配置"。
 _RUNTIME_REGISTRY_NAMES = (
     "_SQL_CONTAINER", "_NS_FILE", "_JINJA_VARS", "_NS_METHODS", "_BIND_VARS",
-    "_METHOD_PARAMS",
+    "_METHOD_PARAMS", "_STATEMENT_KINDS",
 )
 _MAPPING_REGISTRY_NAMES = (
     "_RESULT_SPEC", "_RESULT_MAP_DEFS", "_TYPE_CACHE",
@@ -57,22 +59,33 @@ def isolated_framework_state():
         name: dict(getattr(result_mapping, name)) for name in _MAPPING_REGISTRY_NAMES
     }
     saved_paths = runtime._MAPPER_PATHS
-    saved_factory = base._SESSION_FACTORY
+    saved_database_state = (
+        database._DATABASE_CONFIG,
+        database._POOL,
+        database._POOL_OWNED,
+        database._POOL_FACTORY,
+    )
+    # Package tests may run inside a host application's test suite while its real
+    # pool is open. Detach that state without closing it, then restore it verbatim.
+    database._DATABASE_CONFIG = None
+    database._POOL = None
+    database._POOL_OWNED = False
+    database._POOL_FACTORY = database.asyncpg.create_pool
     reset_state()
     yield
     reset_state()
+    database.clear_database_configuration()
     for name, snapshot in saved_runtime_registries.items():
         getattr(runtime, name).update(snapshot)
     for name, snapshot in saved_mapping_registries.items():
         getattr(result_mapping, name).update(snapshot)
     runtime._MAPPER_PATHS = saved_paths
-    base._SESSION_FACTORY = saved_factory
-
-
-@dataclass
-class FakeResult:
-    returns_rows: bool = False
-    rowcount: int = 1
+    (
+        database._DATABASE_CONFIG,
+        database._POOL,
+        database._POOL_OWNED,
+        database._POOL_FACTORY,
+    ) = saved_database_state
 
 
 class FakeTransaction:
@@ -89,35 +102,60 @@ class FakeTransaction:
             self.owner.rollbacks += 1
 
 
-class FakeSession:
+class FakeConnection:
     def __init__(self):
         self.begins = 0
         self.commits = 0
         self.rollbacks = 0
-        self.executions: list[tuple[object, dict]] = []
+        self.executions: list[tuple[str, tuple]] = []
+
+    def transaction(self, **options):
+        return FakeTransaction(self)
+
+    async def execute(self, statement, *args, timeout=None):
+        self.executions.append((statement, args))
+        return "UPDATE 1"
+
+    async def fetch(self, statement, *args, timeout=None):
+        self.executions.append((statement, args))
+        return []
+
+    async def fetchval(self, statement, *args, column=0, timeout=None):
+        self.executions.append((statement, args))
+        return 1
+
+
+class FakeAcquire:
+    def __init__(self, pool):
+        self.pool = pool
+        self.connection = None
 
     async def __aenter__(self):
-        return self
+        self.connection = FakeConnection()
+        self.pool.connections.append(self.connection)
+        return self.connection
 
     async def __aexit__(self, exc_type, exc, traceback):
         return None
 
-    def begin(self):
-        return FakeTransaction(self)
 
-    async def execute(self, statement, params=None):
-        self.executions.append((statement, params or {}))
-        return FakeResult()
-
-
-class FakeSessionFactory:
+class FakePool:
     def __init__(self):
-        self.sessions: list[FakeSession] = []
+        self.connections: list[FakeConnection] = []
 
-    def __call__(self):
-        session = FakeSession()
-        self.sessions.append(session)
-        return session
+    def acquire(self):
+        return FakeAcquire(self)
+
+    async def close(self):
+        return None
+
+
+class FakeCodecConnection:
+    def __init__(self):
+        self.codecs: dict[str, dict] = {}
+
+    async def set_type_codec(self, type_name, **options):
+        self.codecs[type_name] = options
 
 
 def write_mapper(tmp_path, *, namespace: str, sql: str = "UPDATE demo SET value = :value",
@@ -130,6 +168,57 @@ def write_mapper(tmp_path, *, namespace: str, sql: str = "UPDATE demo SET value 
     return path
 
 
+@pytest.mark.asyncio
+async def test_json_codecs_return_native_values_without_double_encoding_strings():
+    connection = FakeCodecConnection()
+
+    await database._initialize_connection(connection)
+
+    assert set(connection.codecs) == {"json", "jsonb"}
+    for codec in connection.codecs.values():
+        assert codec["format"] == "text"
+        assert codec["decoder"]('{"items":[1,2]}') == {"items": [1, 2]}
+        assert json.loads(codec["encoder"]({"items": [1, 2]})) == {"items": [1, 2]}
+        assert codec["encoder"]('{"already":"serialized"}') == '{"already":"serialized"}'
+
+
+@pytest.mark.asyncio
+async def test_extension_scans_mapper_packages_and_starts_ready(tmp_path, monkeypatch):
+    package_dir = tmp_path / "extension_probe"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "orders_mapper.py").write_text(
+        "from cyt_pymapper import amapper\n"
+        "@amapper()\n"
+        "class OrdersMapper:\n"
+        "    async def update(*, value: str | None = None) -> int: ...\n",
+        encoding="utf-8",
+    )
+    mapper_file = tmp_path / "OrdersMapper.xml"
+    mapper_file.write_text(
+        '<mapper namespace="extension_probe.orders_mapper.OrdersMapper">'
+        '<update id="update">UPDATE demo SET value = :value</update>'
+        "</mapper>",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    pool = FakePool()
+    extension = PyMapperExtension(
+        pool=pool,
+        mapper_paths=[mapper_file],
+        mapper_packages=["extension_probe"],
+    )
+
+    state = await extension.startup()
+    module = importlib.import_module("extension_probe.orders_mapper")
+
+    assert state.statement_count == 1
+    assert state.database_ready is True
+    assert "extension_probe.orders_mapper" in extension.imported_modules
+    assert await module.OrdersMapper.update(value="ready") == 1
+    await extension.shutdown()
+
+
 # ============================================================ 事务语义
 @pytest.mark.asyncio
 async def test_direct_mapper_call_owns_one_short_unit_of_work(tmp_path):
@@ -139,16 +228,16 @@ async def test_direct_mapper_call_owns_one_short_unit_of_work(tmp_path):
     class DirectMapper:
         async def update(*, value: str | None = None) -> int: ...
 
-    factory = FakeSessionFactory()
+    pool = FakePool()
     configure(
-        session_factory=factory,
+        pool=pool,
         mapper_paths=[write_mapper(tmp_path, namespace=namespace)],
     )
 
     assert await DirectMapper.update(value="one") == 1
-    assert current_session() is None
-    assert len(factory.sessions) == 1
-    assert factory.sessions[0].commits == 1
+    assert current_connection() is None
+    assert len(pool.connections) == 1
+    assert pool.connections[0].begins == 0
 
 
 @pytest.mark.asyncio
@@ -159,9 +248,9 @@ async def test_transactional_calls_share_session_and_rollback_together(tmp_path)
     class TransactionalMapper:
         async def update(*, value: str | None = None) -> int: ...
 
-    factory = FakeSessionFactory()
+    pool = FakePool()
     configure(
-        session_factory=factory,
+        pool=pool,
         mapper_paths=[write_mapper(tmp_path, namespace=namespace)],
     )
 
@@ -174,10 +263,10 @@ async def test_transactional_calls_share_session_and_rollback_together(tmp_path)
     with pytest.raises(RuntimeError, match="rollback"):
         await update_twice_then_fail()
 
-    assert len(factory.sessions) == 1
-    assert len(factory.sessions[0].executions) == 2
-    assert factory.sessions[0].commits == 0
-    assert factory.sessions[0].rollbacks == 1
+    assert len(pool.connections) == 1
+    assert len(pool.connections[0].executions) == 2
+    assert pool.connections[0].commits == 0
+    assert pool.connections[0].rollbacks == 1
 
 
 @pytest.mark.asyncio
@@ -188,9 +277,9 @@ async def test_requires_new_uses_independent_session_and_commit(tmp_path):
     class RequiresNewMapper:
         async def update(*, value: str | None = None) -> int: ...
 
-    factory = FakeSessionFactory()
+    pool = FakePool()
     configure(
-        session_factory=factory,
+        pool=pool,
         mapper_paths=[write_mapper(tmp_path, namespace=namespace)],
     )
 
@@ -207,11 +296,11 @@ async def test_requires_new_uses_independent_session_and_commit(tmp_path):
     with pytest.raises(RuntimeError, match="outer rollback"):
         await write_outer_then_fail()
 
-    outer_session, inner_session = factory.sessions
-    assert outer_session.rollbacks == 1
-    assert outer_session.commits == 0
-    assert inner_session.commits == 1
-    assert inner_session.rollbacks == 0
+    outer_connection, inner_connection = pool.connections
+    assert outer_connection.rollbacks == 1
+    assert outer_connection.commits == 0
+    assert inner_connection.commits == 1
+    assert inner_connection.rollbacks == 0
 
 
 @pytest.mark.asyncio
@@ -227,16 +316,18 @@ async def test_omitted_mapper_parameter_is_filled_with_none(tmp_path):
     class OmittedMapper:
         async def update(*, value: str | None = None, po_id: int | None = None) -> int: ...
 
-    factory = FakeSessionFactory()
+    pool = FakePool()
     configure(
-        session_factory=factory,
+        pool=pool,
         mapper_paths=[write_mapper(
             tmp_path, namespace=namespace,
             sql="UPDATE demo SET value = :value WHERE :po_id IS NULL OR id = :po_id")],
     )
 
     await OmittedMapper.update(value="only-this")
-    assert factory.sessions[0].executions[0][1] == {"value": "only-this", "po_id": None}
+    sql, args = pool.connections[0].executions[0]
+    assert "$1" in sql and "$2" in sql
+    assert args == ("only-this", None)
 
 
 # ============================================================ 配置生命周期
@@ -248,15 +339,15 @@ def test_framework_requires_explicit_configuration():
 def test_reconfigure_clears_loaded_sql_and_loads_new_paths(tmp_path):
     """configure(A)→load→configure(B)→load 必须真的加载 B —— 旧实现返回 A 的旧计数。"""
     ns_a, ns_b = "tests.probe.ReloadA", "tests.probe.ReloadB"
-    factory = FakeSessionFactory()
+    pool = FakePool()
 
     # write_mapper 按 namespace 尾段命名文件(ReloadA.xml / ReloadB.xml), 同目录不冲突
-    configure(session_factory=factory,
+    configure(pool=pool,
               mapper_paths=[write_mapper(tmp_path, namespace=ns_a)])
     load_all_mappers()
     assert f"{ns_a}.update" in runtime._SQL_CONTAINER
 
-    configure(session_factory=factory,
+    configure(pool=pool,
               mapper_paths=[write_mapper(tmp_path, namespace=ns_b)])
     assert not runtime._SQL_CONTAINER, "reconfigure 后已加载 SQL 必须被清空"
     load_all_mappers()
@@ -323,23 +414,29 @@ def test_xml_bind_parameter_must_be_declared_by_mapper(tmp_path):
         load_mapper(mapper_file)
 
 
-@pytest.mark.parametrize("sql", [
-    "SELECT * FROM t WHERE id = :po_id",
-    "SELECT to_char(created_at, 'HH24:MI') AS hm FROM t WHERE id = :po_id",
-    "SELECT raw::text FROM t WHERE id = :po_id",
-    "SELECT * FROM t WHERE id IN :ids AND po_no ILIKE :keyword",
-    "SELECT 'https://a.b/c' AS u, '12:30' AS hm FROM t WHERE id=:po_id",
-    "UPDATE t SET a = :a, b = :b WHERE id = :po_id RETURNING id",
+@pytest.mark.parametrize(("sql", "expected"), [
+    ("SELECT * FROM t WHERE id = :po_id", {"po_id"}),
+    ("SELECT to_char(created_at, 'HH24:MI') AS hm FROM t WHERE id = :po_id", {"po_id"}),
+    ("SELECT raw::text FROM t WHERE id = :po_id", {"po_id"}),
+    ("SELECT * FROM t WHERE id IN :ids AND po_no ILIKE :keyword", {"ids", "keyword"}),
+    ("SELECT 'https://a.b/c' AS u, '12:30' AS hm FROM t WHERE id=:po_id", {"po_id"}),
+    ("UPDATE t SET a = :a, b = :b WHERE id = :po_id RETURNING id", {"a", "b", "po_id"}),
+    ("SELECT ':ignored' /* :comment */ -- :line\n, :kept", {"kept"}),
 ])
-def test_bind_param_regex_matches_sqlalchemy(sql):
-    """_NAMED_PARAM 必须与 SQLAlchemy 实际会绑的参数完全一致。
+def test_named_parameter_scanner_ignores_non_executable_sql(sql, expected):
+    assert named_parameter_names(sql) == expected
 
-    绑参契约(_verify_bind_contract)拿这个正则当判据: 多认一个就是加载期假阳性
-    (曾因缺前置守卫把 'HH24:MI' 的 :MI 当成未声明参数, 直接让服务起不来),
-    少认一个就是运行期缺绑参。这里直接跟 text() 的私有解析结果对账 ——
-    SQLAlchemy 升级后若改了规则, 本测试会先炸, 而不是等生产 SQL 炸。
-    """
-    assert set(runtime._NAMED_PARAM.findall(sql)) == set(text(sql)._bindparams)
+
+def test_compile_query_uses_positional_parameters_and_expands_collections():
+    compiled = compile_query(
+        "SELECT * FROM t WHERE id IN :ids AND status=:status OR backup=:status",
+        {"ids": [7, 9], "status": "open"},
+    )
+
+    assert compiled.sql == (
+        "SELECT * FROM t WHERE id IN ($1, $2) AND status=$3 OR backup=$3"
+    )
+    assert compiled.args == (7, 9, "open")
 
 
 def _write_probe_mapper(tmp_path, tag: str, sql: str) -> tuple[object, str]:
@@ -382,7 +479,7 @@ def test_postgres_cast_and_time_literal_not_treated_as_param(tmp_path):
     """::cast 与 '12:30' 这类冒号不能被 render_sql 误当绑参。"""
     from jinja2 import Template
     # 先真加载一轮(render_sql 的惰性入口按 _FULLY_LOADED 判定, 直接注入不算已加载)
-    configure(session_factory=FakeSessionFactory(),
+    configure(pool=FakePool(),
               mapper_paths=[write_mapper(tmp_path, namespace="tests.probe.ColonHost")])
     load_all_mappers()
     runtime._SQL_CONTAINER["probe.colon"] = Template(
@@ -436,7 +533,7 @@ def test_partial_load_does_not_block_full_load(tmp_path):
     """load_mapper(单文件) 之后 load_all_mappers 必须仍然全量加载(先清再重建),
     而不是看容器非空就当已加载 —— 旧实现会让配置目录里其余 XML 永远缺席。"""
     ns_cfg, ns_extra = "tests.probe.ConfiguredNs", "tests.probe.ExtraNs"
-    configure(session_factory=FakeSessionFactory(),
+    configure(pool=FakePool(),
               mapper_paths=[write_mapper(tmp_path, namespace=ns_cfg)])
 
     load_mapper(write_mapper(tmp_path, namespace=ns_extra))   # 局部加载在先
@@ -531,7 +628,7 @@ def test_result_map_rejects_explicit_unknown_model_property_at_startup(tmp_path)
         '</mapper>',
         encoding="utf-8",
     )
-    configure(session_factory=FakeSessionFactory(), mapper_paths=[mapper_file])
+    configure(pool=FakePool(), mapper_paths=[mapper_file])
 
     with pytest.raises(ValueError, match=r"显式映射了模型.*不存在的属性.*missing_property"):
         load_all_mappers()
@@ -547,7 +644,7 @@ def test_invalid_result_type_path_fails_during_full_load(tmp_path):
         '</mapper>',
         encoding="utf-8",
     )
-    configure(session_factory=FakeSessionFactory(), mapper_paths=[mapper_file])
+    configure(pool=FakePool(), mapper_paths=[mapper_file])
 
     with pytest.raises(ValueError, match=r"resultType.*无法导入"):
         load_all_mappers()
