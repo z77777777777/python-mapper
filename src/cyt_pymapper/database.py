@@ -70,7 +70,7 @@ def _encode_json(value: Any) -> str:
 
 
 async def _initialize_connection(connection: asyncpg.Connection) -> None:
-    """Keep JSON values consistent with the mapping behavior used by Buyer."""
+    """Decode PostgreSQL JSON/JSONB columns into native Python values."""
     for type_name in ("json", "jsonb"):
         await connection.set_type_codec(
             type_name,

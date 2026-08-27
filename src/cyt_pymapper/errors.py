@@ -10,4 +10,17 @@ class TooManyResultsError(PyMapperError):
     """A ``single=true`` statement returned more than one database row."""
 
 
-__all__ = ["PyMapperError", "TooManyResultsError"]
+class PaginationError(PyMapperError):
+    """A paginated query declaration or invocation is invalid."""
+
+
+class PaginationConflictError(PaginationError):
+    """Framework pagination conflicts with a manual SQL pagination clause."""
+
+
+__all__ = [
+    "PaginationConflictError",
+    "PaginationError",
+    "PyMapperError",
+    "TooManyResultsError",
+]

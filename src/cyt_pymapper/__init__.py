@@ -24,21 +24,42 @@ from cyt_pymapper.database import (
     open_database,
     ping_database,
 )
-from cyt_pymapper.errors import PyMapperError, TooManyResultsError
+from cyt_pymapper.errors import (
+    PaginationConflictError,
+    PaginationError,
+    PyMapperError,
+    TooManyResultsError,
+)
 from cyt_pymapper.extension import MapperStartupState, PyMapperExtension
+from cyt_pymapper.observability import SqlLoggingPlugin
+from cyt_pymapper.pagination import (
+    DEFAULT_PAGE_SIZE,
+    MAX_PAGE_SIZE,
+    PageMetadata,
+    PaginationOptions,
+    QueryResult,
+)
+from cyt_pymapper.plugins import (
+    StatementContext,
+    StatementExecutor,
+    StatementPlugin,
+    StatementResult,
+)
 from cyt_pymapper.runtime import (
     AMapper,
     amapper,
     configure_mapper_paths,
+    configure_plugins,
     load_all_mappers,
     load_mapper,
+    query,
     render_sql,
     reset_state,
     scalar,
     validate_result_types,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 
 def configure(
@@ -51,6 +72,7 @@ def configure(
     command_timeout: float | None = None,
     ssl=None,
     statement_cache_size: int = 100,
+    plugins: Sequence[StatementPlugin] = (),
 ) -> None:
     """Bind one database backend and the application's XML roots."""
     if (database_url is None) == (pool is None):
@@ -67,16 +89,29 @@ def configure(
             statement_cache_size=statement_cache_size,
         )
     configure_mapper_paths(tuple(mapper_paths))
+    configure_plugins(tuple(plugins))
 
 
 __all__ = [
     "AMapper",
     "ConnectionLike",
+    "DEFAULT_PAGE_SIZE",
+    "MAX_PAGE_SIZE",
     "MapperBase",
     "MapperStartupState",
+    "PageMetadata",
+    "PaginationConflictError",
+    "PaginationError",
+    "PaginationOptions",
     "PoolLike",
     "PyMapperError",
     "PyMapperExtension",
+    "QueryResult",
+    "SqlLoggingPlugin",
+    "StatementContext",
+    "StatementExecutor",
+    "StatementPlugin",
+    "StatementResult",
     "TooManyResultsError",
     "__version__",
     "amapper",
@@ -91,6 +126,7 @@ __all__ = [
     "render_sql",
     "open_database",
     "ping_database",
+    "query",
     "require_connection",
     "reset_state",
     "runtime",

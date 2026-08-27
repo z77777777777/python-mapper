@@ -1,6 +1,8 @@
 # cyt-pymapper
 
-Internal PostgreSQL-first XML mapper runtime backed directly by asyncpg.
+PostgreSQL-first XML mapper runtime backed directly by asyncpg. The package is
+framework-neutral: it does not import FastAPI, a host application's settings,
+logging formatter, schema, or business models.
 
 ## Package layout
 
@@ -8,6 +10,9 @@ Internal PostgreSQL-first XML mapper runtime backed directly by asyncpg.
 - `extension.py`: application bootstrap, mapper-package scanning and pool lifespan.
 - `base.py`: implicit connection and transaction propagation.
 - `compiler.py`: safe `:name` to `$1` compilation and collection expansion.
+- `plugins.py`: generic around-execution plugin contract.
+- `pagination.py`: opt-in list pagination and stable page result models.
+- `observability.py`: parameter-safe structured SQL logging plugin.
 - `mapping.py`: `resultType`/`resultMap`, model validation, row materialization, and
   strict 0..1 cardinality.
 - `errors.py`: public framework exception hierarchy.
@@ -24,26 +29,22 @@ imports and shared global state spread across several files.
 推荐使用扩展完成一次性接线：
 
 ```python
-from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
-from cyt_pymapper import PyMapperExtension
+from cyt_pymapper import PyMapperExtension, SqlLoggingPlugin
 
 pymapper = PyMapperExtension(
     database_url="postgresql://user:password@localhost/database",
     mapper_paths=[Path(__file__).resolve().parent / "mapper"],
     mapper_packages=["app.repositories"],
+    plugins=[SqlLoggingPlugin(slow_query_threshold_ms=500)],
 )
 
-# 包本身不依赖 FastAPI，同一个 lifespan 也可嵌入其他 ASGI 框架。
-@asynccontextmanager
-async def lifespan(app):
+# 把这个生命周期嵌入 FastAPI、Starlette、CLI worker 或自有宿主。
+async def run_application() -> None:
     async with pymapper.lifespan() as state:
         print(state.statement_count)
-        yield
-
-app = FastAPI(lifespan=lifespan)
+        await serve_application()
 ```
 
 扩展会自动导入 `mapper_packages` 下的全部模块、加载 XML、执行启动期契约校验、
@@ -75,6 +76,9 @@ roll back together. `REQUIRED` and `REQUIRES_NEW` propagation are supported;
 
 Jinja blocks may control SQL structure, but values must use named binds
 such as `:order_id`. `{{ value }}` interpolation is rejected while loading XML.
+Only `if/elif/else/endif` Jinja tags are accepted; output, include, macro, loop,
+assignment and filter tags fail during mapper loading. Native asyncpg `$n` binds
+are also rejected because XML statements use one binding contract: `:name`.
 
 ## Result mapping
 
@@ -91,6 +95,61 @@ such as `:order_id`. `{{ value }}` interpolation is rejected while loading XML.
 ```python
 from cyt_pymapper import PyMapperError, TooManyResultsError
 ```
+
+## Optional pagination
+
+分页是显式、可插拔能力。普通 Mapper 调用永远不自动加工 SQL：
+
+```xml
+<select id="list_orders" countRef="count_orders" resultType="app.types.OrderRow">
+    SELECT id, order_no, status
+    FROM orders
+    WHERE status = :status
+    ORDER BY created_at DESC, id DESC
+</select>
+
+<select id="count_orders" expose="false">
+    SELECT COUNT(*) FROM orders WHERE status = :status
+</select>
+```
+
+```python
+from cyt_pymapper import PaginationOptions, query
+
+page_result = await query(
+    OrdersMapper.list_orders,
+    pagination=PaginationOptions(enabled=True, page_number=2),
+    status="active",
+)
+```
+
+- 不配置 `page_size` 时默认 30，最大 200。
+- `enabled=False` 时不添加分页子句、不 count；若 XML 声明了 `<page/>`，只移除
+  这个内部插入标记后执行未分页 SQL。
+- 开启分页时必须有稳定的顶层 `ORDER BY`。
+- `include_total=True` 需要显式 `countRef`；设为 `False` 时通过多取一行判断
+  `has_next`，不执行 count。
+- 不写 `<page/>` 时分页子句追加到 SQL 末尾；`FOR UPDATE` 等需要指定插入位置时
+  使用 `<page/>`。标记必须位于完整的顶层 `ORDER BY` 子句之后、可选的 `FOR`
+  锁定子句之前，不能放进 SELECT 列、WHERE、子查询、字符串或注释。
+- 手写顶层 `LIMIT/OFFSET/FETCH` 与开启的框架分页冲突；关闭框架分页时手写分页
+  完全保留。`<page/>` 与手写分页同时出现会在 XML 加载期失败。
+- 该能力提供页码式 `LIMIT/OFFSET` 分页；百万级深翻页应关闭插件，在业务 Mapper
+  中显式实现基于稳定排序键的游标分页，框架不会猜测宿主的业务游标。
+
+## SQL execution plugins and logging
+
+宿主通过 `plugins=[...]` 配置执行插件。插件只依赖 `StatementContext`、
+`StatementResult` 和 `StatementPlugin`，可用于指标、追踪、审计或只读保护，不依赖
+具体 Web 框架。
+
+`SqlLoggingPlugin` 默认输出结构化 `LogRecord.pymapper`：statement id、最终 asyncpg
+SQL、SQL fingerprint、耗时、连接等待、行数、参数名称和参数类型。它不记录参数值；
+异常使用 `logger.exception` 保留 traceback。宿主可在自己的 JSON formatter 中把
+`record.pymapper` 放进日志载荷。
+
+插件实例是进程级配置，可能被并发请求复用。自定义插件必须保持无状态，或自行保护
+可变状态。
 
 ## 已知坑(写代码前读一遍)
 
@@ -111,3 +170,5 @@ pytest packages/cyt-pymapper/tests
 ```
 
 包测试的 fixture 是快照/还原式, 可以混在宿主项目的 CI 里跑, 不污染宿主 mapper 状态。
+仓库 CI 会在 Windows/Linux 与 Python 3.12/3.13/3.14 上独立运行包测试；
+任何宿主业务库或 Web 框架都不参与这个矩阵。

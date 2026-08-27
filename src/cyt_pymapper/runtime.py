@@ -12,17 +12,41 @@ import functools
 import inspect
 import re
 import threading
+import time
 import xml.etree.ElementTree as ET
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
-from jinja2 import Environment, Template, meta
+from jinja2 import Environment, Template, meta, nodes
 
 from cyt_pymapper import mapping as result_mapping
 from cyt_pymapper.base import MapperBase
-from cyt_pymapper.compiler import compile_query, contains_sql_keyword, named_parameter_names
+from cyt_pymapper.compiler import (
+    compile_query,
+    contains_sql_keyword,
+    contains_top_level_keyword,
+    named_parameter_names,
+    positional_parameter_numbers,
+    sql_token_parenthesis_depths,
+    top_level_sql_word_positions,
+)
 from cyt_pymapper.database import ConnectionLike
+from cyt_pymapper.errors import PaginationConflictError
+from cyt_pymapper.pagination import (
+    PAGE_MARKER,
+    PaginationOptions,
+    PaginationPlugin,
+    PaginationSpec,
+    QueryResult,
+)
+from cyt_pymapper.plugins import (
+    StatementContext,
+    StatementPlugin,
+    StatementResult,
+    run_plugin_chain,
+)
 
 validate_result_types = result_mapping.validate_result_types
 
@@ -37,6 +61,9 @@ _NS_METHODS: dict[str, tuple[str, set[str]]] = {}
 _BIND_VARS: dict[str, set[str]] = {}
 _METHOD_PARAMS: dict[str, set[str]] = {}
 _STATEMENT_KINDS: dict[str, str] = {}
+_PAGINATION_SPECS: dict[str, PaginationSpec] = {}
+_INTERNAL_IDS: set[str] = set()
+_PLUGINS: tuple[StatementPlugin, ...] = ()
 _DecoratedT = TypeVar("_DecoratedT")
 _MAPPER_PATHS: tuple[Path, ...] = ()
 # "配置的全部路径已完整加载"的显式标志。⚠ 不能拿 _SQL_CONTAINER 非空当这个判据:
@@ -48,11 +75,11 @@ _FULLY_LOADED = False
 # Keep casts explicit so named-parameter parsing remains unambiguous.
 _CAST_SUFFIX_PARAM = re.compile(r"(?<![:\w\\]):(\w+)::")
 
-# jinja2 值插值 {{ ... }} —— 实测确认是 SQL 注入口(值被直接拼进 SQL, 完全绕过绑参),
-# 加载期一律硬拦截: 结构用 {% if %}, 值一律 :name。
-# ⚠ 不设"纯标识符放行"白名单: {{ q }}(值) 与 {{ where_common }}(片段) 文法上无法区分,
-#   放行等于留下注入口。片段复用走下面的 <<sql:id>> 机制(加载期展开, 不经 jinja)。
-_JINJA_INTERP = re.compile(r"\{\{(.*?)\}\}", re.S)
+# jinja2 只负责结构条件。值插值、输出表达式及其他语句都在 AST 层拒绝，
+# 由 jinja 自己识别 {%- / {%+ 等词法变体，避免安全边界依赖正则追语法。
+_EXECUTABLE_MAPPER_TAGS = frozenset({"select", "insert", "update", "delete"})
+_DECLARATION_MAPPER_TAGS = frozenset({"sql", "resultMap"})
+_ALLOWED_MAPPER_TAGS = _EXECUTABLE_MAPPER_TAGS | _DECLARATION_MAPPER_TAGS
 
 # SQL 片段: <sql id="x">…</sql> 声明, <include refid="x"/> 引用(与 MyBatis 同语法)。
 # 用途: list 与 count 共用同一套 WHERE, 改一处两边生效。
@@ -82,6 +109,16 @@ def configure_mapper_paths(paths: list[str | Path] | tuple[str | Path, ...]) -> 
         global _MAPPER_PATHS
         _MAPPER_PATHS = normalized
         _clear_loaded_sql()
+
+
+def configure_plugins(plugins: tuple[StatementPlugin, ...] | list[StatementPlugin]) -> None:
+    """Replace the process-local statement plugin chain.
+
+    Plugins are package-level runtime configuration, not application imports. An
+    empty sequence preserves the original direct execution path.
+    """
+    global _PLUGINS
+    _PLUGINS = tuple(plugins)
 
 
 def load_all_mappers() -> int:
@@ -126,8 +163,9 @@ def reset_state() -> None:
         _clear_loaded_sql()
         _NS_METHODS.clear()
         _METHOD_PARAMS.clear()
-        global _MAPPER_PATHS
+        global _MAPPER_PATHS, _PLUGINS
         _MAPPER_PATHS = ()
+        _PLUGINS = ()
 
 
 def _clear_loaded_sql() -> None:
@@ -140,6 +178,8 @@ def _clear_loaded_sql() -> None:
     result_mapping.clear_result_mappings()
     _BIND_VARS.clear()
     _STATEMENT_KINDS.clear()
+    _PAGINATION_SPECS.clear()
+    _INTERNAL_IDS.clear()
 
 
 def load_mapper(path: str | Path) -> None:
@@ -158,6 +198,13 @@ def load_mapper(path: str | Path) -> None:
                 f"namespace '{namespace}' 已属于 {_NS_FILE[namespace]}, "
                 f"不允许再出现在 {file} (1 XML ↔ 1 mapper, 不交叉)")
         _NS_FILE[namespace] = file
+
+        for child in root:
+            if child.tag not in _ALLOWED_MAPPER_TAGS:
+                raise ValueError(
+                    f"不支持的 mapper 标签 <{child.tag}>: {file}; "
+                    "只允许 select/insert/update/delete/sql/resultMap"
+                )
 
         # 第一轮: 收声明块 —— <sql> 复用片段 与 <resultMap> 结果映射(都不是可执行条目)
         frag_els: dict[str, ET.Element] = {}
@@ -185,8 +232,89 @@ def load_mapper(path: str | Path) -> None:
             sql = _element_sql(child, frag_els, full_id, file)
             _reject_interpolation(full_id, sql, file)
             _reject_cast_suffix(full_id, sql, file)
+            native_positions = sorted(positional_parameter_numbers(sql))
+            if native_positions:
+                rendered_positions = [f"${position}" for position in native_positions]
+                raise ValueError(
+                    f"mapper 条目 '{full_id}' ({file.name}) 使用了原生位置参数 "
+                    f"{rendered_positions} —— XML SQL 只允许命名绑参 :name"
+                )
+            marker_count = sql.count(PAGE_MARKER)
+            marker_depths = sql_token_parenthesis_depths(sql, PAGE_MARKER)
+            if marker_count and (
+                len(marker_depths) != marker_count
+                or any(depth != 0 for depth in marker_depths)
+            ):
+                raise PaginationConflictError(
+                    f"mapper '{full_id}' ({file.name}) 的 <page/> 必须位于 SQL 顶层"
+                )
+            if marker_count > 1:
+                raise PaginationConflictError(
+                    f"mapper '{full_id}' ({file.name}) contains more than one <page/>"
+                )
+            if marker_count and child.tag.lower() != "select":
+                raise PaginationConflictError(
+                    f"mapper '{full_id}' ({file.name}) uses <page/> outside <select>"
+                )
+            if marker_count and any(
+                contains_top_level_keyword(sql, keyword)
+                for keyword in ("LIMIT", "OFFSET", "FETCH")
+            ):
+                raise PaginationConflictError(
+                    f"mapper '{full_id}' ({file.name}) contains both <page/> and "
+                    "top-level LIMIT/OFFSET/FETCH"
+                )
+            if marker_count:
+                marker_offset = sql.index(PAGE_MARKER)
+                positioned_words = top_level_sql_word_positions(sql)
+                words_before_marker = tuple(
+                    word for word, offset in positioned_words if offset < marker_offset
+                )
+                words_after_marker = tuple(
+                    word for word, offset in positioned_words if offset > marker_offset
+                )
+                has_order_by_before_marker = any(
+                    words_before_marker[index:index + 2] == ("ORDER", "BY")
+                    for index in range(max(0, len(words_before_marker) - 1))
+                )
+                if (
+                    not has_order_by_before_marker
+                    or (words_after_marker and words_after_marker[0] != "FOR")
+                ):
+                    raise PaginationConflictError(
+                        f"mapper '{full_id}' ({file.name}) 的 <page/> 必须位于完整的"
+                        "顶层 ORDER BY 子句之后；其后仅可保留 FOR 锁定子句"
+                    )
             _SQL_CONTAINER[full_id] = Template(sql)
             _STATEMENT_KINDS[full_id] = child.tag.lower()
+            raw_count_ref = child.attrib.get("countRef")
+            count_ref = raw_count_ref.strip() if raw_count_ref is not None else None
+            if count_ref is not None and not count_ref:
+                raise ValueError(
+                    f"mapper '{full_id}' ({file.name}) countRef must not be empty"
+                )
+            if count_ref is not None and "." in count_ref:
+                raise ValueError(
+                    f"mapper '{full_id}' ({file.name}) countRef must be a local statement id"
+                )
+            if count_ref is not None and child.tag != "select":
+                raise ValueError(
+                    f"mapper '{full_id}' ({file.name}) countRef is only valid on <select>"
+                )
+            count_statement_id = f"{namespace}.{count_ref}" if count_ref else None
+            if count_statement_id is not None or marker_count:
+                _PAGINATION_SPECS[full_id] = PaginationSpec(
+                    statement_id=full_id,
+                    count_statement_id=count_statement_id,
+                    marker_count=marker_count,
+                )
+            expose = child.attrib.get("expose", "true").strip().lower()
+            if expose not in {"true", "false"}:
+                raise ValueError(
+                    f"mapper '{full_id}' ({file.name}) expose must be true or false"
+                )
+            if expose == "false":
+                _INTERNAL_IDS.add(full_id)
             result_mapping.load_result_spec(namespace, full_id, child, file)
             # 模板里 {% if xxx %} 引用的变量名(不含 :name 绑参) —— 首次调用时与方法签名比对,
             # 抓"XML 写了签名没声明的名字"这类拼写错。
@@ -197,6 +325,26 @@ def load_mapper(path: str | Path) -> None:
             _verify_bind_contract(full_id)
 
         # 该 namespace 的 Mapper 类若已 import, 立刻做双向对齐(见 _verify_namespace)
+        for statement_id, pagination_spec in _PAGINATION_SPECS.items():
+            if not statement_id.startswith(namespace + "."):
+                continue
+            count_statement_id = pagination_spec.count_statement_id
+            if count_statement_id is None:
+                continue
+            if count_statement_id == statement_id:
+                raise ValueError(
+                    f"mapper '{statement_id}' ({file.name}) countRef must not reference itself"
+                )
+            if count_statement_id not in _SQL_CONTAINER:
+                raise ValueError(
+                    f"mapper '{statement_id}' ({file.name}) countRef points to missing "
+                    f"statement '{count_statement_id}'"
+                )
+            if _STATEMENT_KINDS.get(count_statement_id) != "select":
+                raise ValueError(
+                    f"mapper '{statement_id}' ({file.name}) countRef must point to <select>"
+                )
+            _verify_count_ref_contract(statement_id)
         _verify_namespace(namespace)
 
 
@@ -213,10 +361,18 @@ def _element_sql(elem: ET.Element, frag_els: dict[str, ET.Element], full_id: str
             f"{_MAX_FRAGMENT_DEPTH} 层, 疑似循环引用")
     parts = [elem.text or ""]
     for sub in elem:
+        if sub.tag == "page":
+            if (sub.text or "").strip() or list(sub) or sub.attrib:
+                raise ValueError(
+                    f"mapper 条目 '{full_id}' ({file.name}) 的 <page/> 不接受属性或内容"
+                )
+            parts.append(PAGE_MARKER)
+            parts.append(sub.tail or "")
+            continue
         if sub.tag != "include":
             raise ValueError(
                 f"mapper 条目 '{full_id}' ({file.name}) 含不支持的子元素 <{sub.tag}> "
-                "(本 runtime 只支持 <include refid=\"…\"/>; 条件判断请用 jinja2 {% if %})")
+                "(只支持 <include refid=\"…\"/> 与 <page/>; 条件判断请用 jinja2 {% if %})")
         refid = sub.attrib.get("refid")
         if not refid or refid not in frag_els:
             raise ValueError(
@@ -228,12 +384,31 @@ def _element_sql(elem: ET.Element, frag_els: dict[str, ET.Element], full_id: str
 
 
 def _reject_interpolation(full_id: str, sql: str, file: Path) -> None:
-    """加载期拦截 {{ 值 }} 插值 —— 它会把值直接拼进 SQL(实测可注入), 必须用 :name 绑参。"""
-    for interpolation_match in _JINJA_INTERP.finditer(sql):
-        expression = interpolation_match.group(1)
-        raise ValueError(
-            f"mapper 条目 '{full_id}' ({file.name}) 含 jinja 值插值 '{{{{{expression}}}}}' —— "
-            "这会把值拼进 SQL 造成注入。值请改用命名绑参 :name; jinja 只用 {% if %} 控结构。")
+    """Allow structural conditions only; all SQL values must use binds."""
+    parsed_template = _JINJA_ENV.parse(sql)
+
+    def validate_statements(statements: Sequence[nodes.Node]) -> None:
+        for statement in statements:
+            if isinstance(statement, nodes.Output):
+                if all(isinstance(value, nodes.TemplateData) for value in statement.nodes):
+                    continue
+                raise ValueError(
+                    f"mapper 条目 '{full_id}' ({file.name}) 含 jinja 值插值或输出表达式 —— "
+                    "这会把值拼进 SQL 造成注入。值请改用命名绑参 :name; "
+                    "jinja 只允许 if/elif/else/endif 控制 SQL 结构。"
+                )
+            if isinstance(statement, nodes.If):
+                validate_statements(statement.body)
+                validate_statements(statement.elif_)
+                validate_statements(statement.else_)
+                continue
+            raise ValueError(
+                f"mapper 条目 '{full_id}' ({file.name}) 使用了不安全的 jinja 标签 "
+                f"'{type(statement).__name__}' —— jinja 只允许 if/elif/else/endif 控制 SQL "
+                "结构，所有值必须使用命名绑参 :name。"
+            )
+
+    validate_statements(parsed_template.body)
 
 
 def _reject_cast_suffix(full_id: str, sql: str, file: Path) -> None:
@@ -285,13 +460,17 @@ def _ensure_loaded() -> None:
 
 
 @dataclass(frozen=True, slots=True)
-class ExecutionResult:
-    rows: list[Any] | None
-    rowcount: int
+class _StatementExecution:
+    result: StatementResult
+    context: StatementContext
 
-    @property
-    def returns_rows(self) -> bool:
-        return self.rows is not None
+
+@dataclass(frozen=True, slots=True)
+class _ExecutionOptions:
+    plugins: Sequence[StatementPlugin] | None = None
+    operation: str = "query"
+    parent_statement_id: str | None = None
+    connection_wait_ms: float = 0.0
 
 
 def _command_rowcount(status: str) -> int:
@@ -302,34 +481,94 @@ def _command_rowcount(status: str) -> int:
     return 0
 
 
+async def _execute_with_context(
+    connection: ConnectionLike,
+    full_id: str,
+    mapper_parameters: Mapping[str, Any],
+    execution_options: _ExecutionOptions | None = None,
+) -> _StatementExecution:
+    """Render and execute one statement through the configured plugin chain."""
+    options = execution_options or _ExecutionOptions()
+    _ensure_loaded()
+    input_parameters = dict(mapper_parameters)
+    sql, params = render_sql(full_id, **input_parameters)
+    statement_kind = _STATEMENT_KINDS.get(full_id)
+
+    async def execute_related(
+        related_statement_id: str,
+        related_parameters: Mapping[str, Any],
+        related_operation: str,
+        related_parent_statement_id: str | None,
+    ) -> StatementResult:
+        related_execution = await _execute_with_context(
+            connection,
+            related_statement_id,
+            related_parameters,
+            _ExecutionOptions(
+                plugins=_PLUGINS,
+                operation=related_operation,
+                parent_statement_id=related_parent_statement_id,
+            ),
+        )
+        return related_execution.result
+
+    context = StatementContext(
+        statement_id=full_id,
+        statement_kind=statement_kind,
+        sql=sql,
+        input_parameters=input_parameters,
+        parameters=params,
+        connection=connection,
+        execute_related=execute_related,
+        operation=options.operation,
+        parent_statement_id=options.parent_statement_id,
+        connection_wait_ms=options.connection_wait_ms,
+    )
+
+    async def terminal(current: StatementContext) -> StatementResult:
+        # <page/> only declares where an enabled pagination plugin inserts its
+        # clause. Direct calls and explicitly disabled pagination are valid
+        # unpaged executions, so the internal marker must never reach asyncpg.
+        if PAGE_MARKER in current.sql:
+            current.sql = current.sql.replace(PAGE_MARKER, "")
+        compiled = compile_query(current.sql, current.parameters)
+        current.compiled_sql = compiled.sql
+        current.compiled_args = compiled.args
+        # XML entries carry an explicit statement kind. Direct registrations used
+        # by extensions/tests do not, so infer only from the first executable word.
+        first_keyword = re.match(r"\s*([A-Za-z]+)", current.sql)
+        returns_rows = (
+            current.statement_kind == "select"
+            or (
+                current.statement_kind is None
+                and first_keyword is not None
+                and first_keyword.group(1).upper()
+                in {"SELECT", "SHOW", "VALUES", "EXPLAIN"}
+            )
+            or contains_sql_keyword(current.sql, "RETURNING")
+        )
+        if returns_rows:
+            rows = list(await current.connection.fetch(compiled.sql, *compiled.args))
+            return StatementResult(rows=rows, rowcount=len(rows))
+        status = await current.connection.execute(compiled.sql, *compiled.args)
+        return StatementResult(rows=None, rowcount=_command_rowcount(status))
+
+    result = await run_plugin_chain(
+        context,
+        _PLUGINS if options.plugins is None else options.plugins,
+        terminal,
+    )
+    return _StatementExecution(result=result, context=context)
+
+
 async def _execute(
     connection: ConnectionLike,
     full_id: str,
     **kwargs: Any,
-) -> ExecutionResult:
-    """Render, compile and execute one statement on an asyncpg connection."""
-    _ensure_loaded()
-    sql, params = render_sql(full_id, **kwargs)
-    compiled = compile_query(sql, params)
-    statement_kind = _STATEMENT_KINDS.get(full_id)
-    # XML entries carry an explicit statement kind. Directly registered templates
-    # (tests/extensions) do not, so infer only from the first executable keyword;
-    # searching for SELECT anywhere would misclassify INSERT ... SELECT statements.
-    first_keyword = re.match(r"\s*([A-Za-z]+)", sql)
-    returns_rows = (
-        statement_kind == "select"
-        or (
-            statement_kind is None
-            and first_keyword is not None
-            and first_keyword.group(1).upper() in {"SELECT", "SHOW", "VALUES", "EXPLAIN"}
-        )
-        or contains_sql_keyword(sql, "RETURNING")
-    )
-    if returns_rows:
-        rows = list(await connection.fetch(compiled.sql, *compiled.args))
-        return ExecutionResult(rows=rows, rowcount=len(rows))
-    status = await connection.execute(compiled.sql, *compiled.args)
-    return ExecutionResult(rows=None, rowcount=_command_rowcount(status))
+) -> StatementResult:
+    """Backward-compatible raw execution primitive without result materialization."""
+    execution = await _execute_with_context(connection, full_id, kwargs)
+    return execution.result
 
 
 def _declared_defaults(func) -> dict[str, Any]:
@@ -349,8 +588,10 @@ def _make_wrapper(full_id: str, func, owner: MapperBase | type[MapperBase]):
     # reset/重载后失效, 已废弃。
     defaults = _declared_defaults(func)
 
-    @functools.wraps(func)
-    async def wrapper(**kwargs: Any):
+    async def invoke(
+        kwargs: Mapping[str, Any],
+        plugins: Sequence[StatementPlugin] | None = None,
+    ) -> tuple[Any, StatementContext]:
         unknown = sorted(set(kwargs) - set(defaults))
         if unknown:
             raise TypeError(
@@ -359,13 +600,70 @@ def _make_wrapper(full_id: str, func, owner: MapperBase | type[MapperBase]):
         # ⚠ 必须按签名补全: jinja2 里未传的名字是 Undefined, 而 `Undefined is not none`
         # 求值为 True —— 不补全会导致"省略参数"仍渲染出该 SET/WHERE 子句, 但绑参缺失而报错
         # (甚至在 `{% if x %}` 写法下静默生成错 SQL)。补全后 jinja 永远看到显式值。
-        merged = {**defaults, **kwargs}
+        merged = {**defaults, **dict(kwargs)}
+        connection_started_at = time.perf_counter()
         async with owner.acquire_connection() as connection:
-            result = await _execute(connection, full_id, **merged)
+            connection_wait_ms = (time.perf_counter() - connection_started_at) * 1000
+            execution = await _execute_with_context(
+                connection,
+                full_id,
+                merged,
+                _ExecutionOptions(
+                    plugins=plugins,
+                    connection_wait_ms=connection_wait_ms,
+                ),
+            )
+            result = execution.result
             if result.returns_rows:
-                return result_mapping.shape_rows(full_id, result.rows or [])
-            return result.rowcount
+                shaped = result_mapping.shape_rows(full_id, result.rows or [])
+                return shaped, execution.context
+            return result.rowcount, execution.context
+
+    @functools.wraps(func)
+    async def wrapper(**kwargs: Any):
+        value, _ = await invoke(kwargs)
+        return value
+
+    mapper_wrapper = cast(Any, wrapper)
+    mapper_wrapper.__pymapper_invoke__ = invoke
+    mapper_wrapper.__pymapper_statement_id__ = full_id
     return wrapper
+
+
+async def query[QueryItemT](
+    statement: Callable[..., Awaitable[list[QueryItemT]]],
+    *,
+    pagination: PaginationOptions,
+    **kwargs: Any,
+) -> QueryResult[QueryItemT]:
+    """Execute a list mapper with optional, per-call pagination.
+
+    ``enabled=False`` adds no pagination clause and performs no count. An XML
+    ``<page/>`` insertion marker is removed before an unpaged statement reaches
+    the database. Enabled pagination is available only for functions produced by
+    ``@amapper`` so the plugin can share the mapper's connection and metadata.
+    """
+    if not pagination.enabled:
+        raw_value = await statement(**kwargs)
+        if not isinstance(raw_value, list):
+            raise TypeError("query() requires a mapper that returns a list")
+        return QueryResult(items=raw_value)
+
+    _ensure_loaded()
+    invoke = getattr(statement, "__pymapper_invoke__", None)
+    statement_id = getattr(statement, "__pymapper_statement_id__", None)
+    if invoke is None or not isinstance(statement_id, str):
+        raise TypeError("enabled pagination requires a function produced by @amapper")
+    pagination_spec = _PAGINATION_SPECS.get(
+        statement_id,
+        PaginationSpec(statement_id=statement_id),
+    )
+    selected_plugins = (PaginationPlugin(pagination, pagination_spec), *_PLUGINS)
+    value, context = await invoke(kwargs, selected_plugins)
+    if not isinstance(value, list):
+        raise TypeError("query() requires a mapper that returns a list")
+    metadata = context.attributes.get("pagination")
+    return QueryResult(items=value, pagination=metadata)
 
 
 def _verify_bind_contract(full_id: str) -> None:
@@ -398,10 +696,36 @@ def _verify_bind_contract(full_id: str) -> None:
                 f"—— 拼写错或签名漏了参数 (签名: {sorted(method_params)})")
 
 
+def _verify_count_ref_contract(statement_id: str) -> None:
+    """Validate a hidden count statement against its paginated list signature."""
+    pagination_spec = _PAGINATION_SPECS.get(statement_id)
+    method_params = _METHOD_PARAMS.get(statement_id)
+    if pagination_spec is None or method_params is None:
+        return
+    count_statement_id = pagination_spec.count_statement_id
+    if count_statement_id is None or count_statement_id not in _SQL_CONTAINER:
+        return
+    count_variables = (
+        _BIND_VARS.get(count_statement_id, set())
+        | _JINJA_VARS.get(count_statement_id, set())
+    )
+    undeclared = sorted(count_variables - method_params)
+    if undeclared:
+        raise ValueError(
+            f"mapper '{statement_id}': countRef '{count_statement_id}' uses parameters "
+            f"not declared by the paginated Mapper method {undeclared} "
+            f"(signature: {sorted(method_params)})"
+        )
+
+
 def _xml_ids(namespace: str) -> set[str]:
     """该 namespace 下已加载的可执行条目 id(不含 <sql> 片段与 <resultMap>, 它们不进容器)。"""
     prefix = f"{namespace}."
-    return {key[len(prefix):] for key in _SQL_CONTAINER if key.startswith(prefix)}
+    return {
+        key[len(prefix):]
+        for key in _SQL_CONTAINER
+        if key.startswith(prefix) and key not in _INTERNAL_IDS
+    }
 
 
 def _verify_namespace(namespace: str) -> None:
@@ -499,6 +823,7 @@ class AMapper(MapperBase):
                 _check_signature(full_id, declared_func)
                 _METHOD_PARAMS[full_id] = set(_declared_defaults(declared_func))
                 _verify_bind_contract(full_id)
+                _verify_count_ref_contract(full_id)
                 setattr(target, name, staticmethod(_make_wrapper(full_id, declared_func, self)))
                 bound.add(name)
             _NS_METHODS[namespace] = (target.__qualname__, bound)
@@ -513,6 +838,7 @@ class AMapper(MapperBase):
         _check_signature(full_id, target)
         _METHOD_PARAMS[full_id] = set(_declared_defaults(target))
         _verify_bind_contract(full_id)
+        _verify_count_ref_contract(full_id)
         return _make_wrapper(full_id, target, self)
 
 

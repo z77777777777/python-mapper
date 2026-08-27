@@ -19,7 +19,8 @@ from cyt_pymapper.database import (
     open_database,
     ping_database,
 )
-from cyt_pymapper.runtime import configure_mapper_paths, load_all_mappers
+from cyt_pymapper.plugins import StatementPlugin
+from cyt_pymapper.runtime import configure_mapper_paths, configure_plugins, load_all_mappers
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,7 @@ class PyMapperExtension:
         command_timeout: float | None = None,
         ssl: Any = None,
         statement_cache_size: int = 100,
+        plugins: Sequence[StatementPlugin] = (),
     ) -> None:
         if (database_url is None) == (pool is None):
             raise ValueError("PyMapperExtension requires exactly one of database_url or pool")
@@ -87,6 +89,7 @@ class PyMapperExtension:
                 statement_cache_size=statement_cache_size,
             )
         configure_mapper_paths(tuple(mapper_paths))
+        configure_plugins(tuple(plugins))
 
     @property
     def imported_modules(self) -> tuple[str, ...]:
