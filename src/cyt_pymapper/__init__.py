@@ -35,6 +35,7 @@ from cyt_pymapper.observability import SqlLoggingPlugin
 from cyt_pymapper.pagination import (
     DEFAULT_PAGE_SIZE,
     MAX_PAGE_SIZE,
+    Page,
     PageMetadata,
     PaginationOptions,
     QueryResult,
@@ -99,6 +100,7 @@ __all__ = [
     "MAX_PAGE_SIZE",
     "MapperBase",
     "MapperStartupState",
+    "Page",
     "PageMetadata",
     "PaginationConflictError",
     "PaginationError",

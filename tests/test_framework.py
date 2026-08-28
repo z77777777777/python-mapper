@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 import pytest
 from cyt_pymapper import (
+    Page,
     PaginationConflictError,
     PaginationError,
     PaginationOptions,
@@ -337,6 +338,46 @@ async def test_pagination_enabled_uses_default_size_and_explicit_count_ref(tmp_p
     assert count_args == ("open",)
     assert "LIMIT $2 OFFSET $3" in page_statement
     assert page_args == ("open", 30, 30)
+
+
+@pytest.mark.asyncio
+async def test_page_mapper_returns_flat_page_directly(tmp_path):
+    namespace = "tests.probe.CompletedPageMapper"
+
+    @amapper(namespace=namespace)
+    class CompletedPageMapper:
+        async def list_rows(
+            *, status: str | None = None, page: int = 1, page_size: int = 30,
+        ) -> Page[dict]: ...
+
+        async def count_rows(*, status: str | None = None) -> list[dict]: ...
+
+    mapper_file = tmp_path / "CompletedPageMapper.xml"
+    mapper_file.write_text(
+        f'<mapper namespace="{namespace}">'
+        '<select id="list_rows" countRef="count_rows">'
+        'SELECT id AS row_id, name FROM demo WHERE status = :status ORDER BY id'
+        '</select>'
+        '<select id="count_rows">SELECT COUNT(*) FROM demo WHERE status = :status</select>'
+        '</mapper>',
+        encoding="utf-8",
+    )
+    connection = PaginationConnection()
+    configure(pool=FakePool(), mapper_paths=[mapper_file])
+
+    async with bind_connection(connection):
+        result = await CompletedPageMapper.list_rows(
+            page=2,
+            status="open",
+        )
+
+    assert result == Page(
+        items=[{"row_id": 31, "name": "page-two"}],
+        total=61,
+        page=2,
+        page_size=30,
+        pages=3,
+    )
 
 
 @pytest.mark.asyncio

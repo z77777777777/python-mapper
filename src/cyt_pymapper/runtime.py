@@ -17,7 +17,7 @@ import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any, TypeVar, cast, get_origin, get_type_hints
 
 from jinja2 import Environment, Template, meta, nodes
 
@@ -36,6 +36,8 @@ from cyt_pymapper.database import ConnectionLike
 from cyt_pymapper.errors import PaginationConflictError
 from cyt_pymapper.pagination import (
     PAGE_MARKER,
+    Page,
+    PageMetadata,
     PaginationOptions,
     PaginationPlugin,
     PaginationSpec,
@@ -587,6 +589,7 @@ def _make_wrapper(full_id: str, func, owner: MapperBase | type[MapperBase]):
     # 各触发一次), wrapper 只管每次调用的 kwargs 合法性 —— 旧版的首调闭包标记在
     # reset/重载后失效, 已废弃。
     defaults = _declared_defaults(func)
+    returns_page = get_origin(get_type_hints(func).get("return")) is Page
 
     async def invoke(
         kwargs: Mapping[str, Any],
@@ -621,6 +624,33 @@ def _make_wrapper(full_id: str, func, owner: MapperBase | type[MapperBase]):
 
     @functools.wraps(func)
     async def wrapper(**kwargs: Any):
+        if returns_page:
+            _ensure_loaded()
+            pagination = PaginationOptions(
+                enabled=True,
+                page_number=kwargs.get("page", defaults.get("page", 1)),
+                page_size=kwargs.get(
+                    "page_size",
+                    defaults.get("page_size", 30),
+                ),
+                include_total=True,
+            )
+            pagination_spec = _PAGINATION_SPECS.get(
+                full_id,
+                PaginationSpec(statement_id=full_id),
+            )
+            value, context = await invoke(
+                kwargs,
+                (PaginationPlugin(pagination, pagination_spec), *_PLUGINS),
+            )
+            metadata = cast(PageMetadata, context.attributes["pagination"])
+            return Page(
+                items=cast(list[Any], value),
+                total=cast(int, metadata.total),
+                page=metadata.page_number,
+                page_size=metadata.page_size,
+                pages=cast(int, metadata.total_pages),
+            )
         value, _ = await invoke(kwargs)
         return value
 

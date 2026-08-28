@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from cyt_pymapper.compiler import (
     contains_top_level_keyword,
@@ -50,6 +50,17 @@ class PageMetadata:
     total: int | None
     total_pages: int | None
     has_next: bool
+
+
+@dataclass(slots=True)
+class Page[ItemValue]:
+    """Framework-neutral page returned directly by a ``Page[T]`` mapper."""
+
+    items: list[ItemValue] = field(default_factory=list)
+    total: int = 0
+    page: int = 1
+    page_size: int = DEFAULT_PAGE_SIZE
+    pages: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +215,7 @@ __all__ = [
     "DEFAULT_PAGE_SIZE",
     "MAX_PAGE_SIZE",
     "PAGE_MARKER",
+    "Page",
     "PageMetadata",
     "PaginationOptions",
     "PaginationPlugin",

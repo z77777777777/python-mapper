@@ -114,14 +114,26 @@ from cyt_pymapper import PyMapperError, TooManyResultsError
 ```
 
 ```python
-from cyt_pymapper import PaginationOptions, query
+from cyt_pymapper import Page
 
-page_result = await query(
-    OrdersMapper.list_orders,
-    pagination=PaginationOptions(enabled=True, page_number=2),
+class OrdersMapper:
+    async def list_orders(
+        *, status: str | None = None, page: int = 1, page_size: int = 30,
+    ) -> Page[OrderRow]: ...
+
+page_result = await OrdersMapper.list_orders(
+    page=2,
     status="active",
 )
 ```
+
+返回注解为 `Page[T]` 时，Mapper 调用直接返回与 Web 框架无关的成品分页对象，
+字段固定为 `items / total / page / page_size / pages`。框架把 SQL 返回的
+`list[T]` 放入 `Page`，调用方不接触 `PaginationOptions`、`QueryResult` 或
+`PageMetadata`。不分页的方法继续声明并返回 `list[T]`。
+
+`query(..., pagination=PaginationOptions(...))` 仅保留为低层入口，用于动态关闭
+分页或 `include_total=False` 的 slice/`has_next` 场景。
 
 - 不配置 `page_size` 时默认 30，最大 200。
 - `enabled=False` 时不添加分页子句、不 count；若 XML 声明了 `<page/>`，只移除
