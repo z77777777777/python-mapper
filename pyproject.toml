@@ -8,10 +8,30 @@ version = "0.3.0"
 description = "PostgreSQL XML mapper with asyncpg pooling and implicit transactions"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "z77777777777" }]
+keywords = ["postgresql", "asyncpg", "sql", "mapper", "mybatis", "xml", "async"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: SQL",
+  "Topic :: Database",
+  "Topic :: Database :: Front-Ends",
+  "Typing :: Typed",
+]
 dependencies = [
   "Jinja2>=3.1,<4",
   "asyncpg>=0.31,<1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/z77777777777/python-mapper"
+Repository = "https://github.com/z77777777777/python-mapper"
+Issues = "https://github.com/z77777777777/python-mapper/issues"
 
 [project.optional-dependencies]
 # 包测试自带依赖声明: 换个环境跑 tests/ 不再靠宿主项目碰巧装了 pytest-asyncio

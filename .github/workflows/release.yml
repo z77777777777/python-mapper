@@ -1,0 +1,65 @@
+# 打 tag 就发 PyPI。
+#
+# 走 Trusted Publishing(OIDC), 仓库里不存任何 token: PyPI 侧配置成信任
+# z77777777777/python-mapper 的 release.yml, 发布时用短期凭证换取上传权限。
+# 改这个文件名要同步改 PyPI 项目设置里的 workflow 名, 否则发布会被拒。
+#
+# 发布流程: 改 pyproject 的 version → 提交 → git tag vX.Y.Z → git push --tags
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  # 先跑一遍测试再发 —— 发出去的版本不可撤回(PyPI 同一版本号不允许重传)
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -e ".[test]"
+      - run: python -m pytest -q
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install build
+          python -m build
+      - name: Verify tag matches package version
+        # 防止 tag 与 pyproject 版本对不上就发出去 —— 那种包谁都查不明白
+        run: |
+          VERSION=$(python -c "import tomllib,pathlib;print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          TAG="${GITHUB_REF_NAME#v}"
+          test "$VERSION" = "$TAG" || { echo "tag $TAG != version $VERSION"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # OIDC 换临时凭证要这个; 没有它 trusted publishing 直接失败
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
