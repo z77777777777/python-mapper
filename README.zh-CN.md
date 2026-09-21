@@ -2,16 +2,48 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
-面向 PostgreSQL 的 XML mapper 运行时，直接跑在 asyncpg 上。包本身与框架无关：
-不 import FastAPI，也不碰宿主的配置、日志 formatter、schema 或业务模型。
+一款轻量的 Python 异步 XML 映射工具，把 SQL 从业务代码里解离出来——查询写在 XML 里，
+Python 侧只留签名，于是一个 service 方法读起来就是业务本身，而不是绕着游标拼字符串。
+
+面向 PostgreSQL，直接跑在 asyncpg 上。包本身与框架无关：不 import FastAPI，
+也不碰宿主的配置、日志 formatter、schema 或业务模型。
 
 ## 安装
 
 ```bash
-pip install "git+https://github.com/z77777777777/python-mapper.git@v0.3.0"
+pip install python-mapper
 ```
 
 需要 Python 3.12+。运行时依赖只有 `asyncpg` 和 `Jinja2`。
+
+## 只支持异步
+
+所有执行路径都是异步的：mapper 调用、`query()`、`scalar()` 返回的都是协程，
+`transactional()` 装同步函数会在**装饰期**直接 `TypeError`。这不是没做，而是底层驱动
+asyncpg 本身就没有同步 API。
+
+要在同步框架里用（Flask、传统 Django view、脚本），起一个常驻事件循环放在后台线程，
+把调用提交过去：
+
+```python
+import asyncio
+import threading
+
+loop = asyncio.new_event_loop()
+threading.Thread(target=loop.run_forever, daemon=True).start()
+
+# 连接池只在这个 loop 上开一次
+asyncio.run_coroutine_threadsafe(open_database(...), loop).result()
+
+# 之后在同步代码里这样调
+rows = asyncio.run_coroutine_threadsafe(
+    OrdersMapper.find(order_id=1), loop,
+).result()
+```
+
+**不要**给每次调用套 `asyncio.run()`。那样每次都新建一个事件循环，而 asyncpg 的连接池
+绑死在创建它的那个 loop 上——结果要么报 "attached to a different loop"，要么每个请求
+重建一次连接池。
 
 ## 模块划分
 

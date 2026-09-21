@@ -2,17 +2,51 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
-PostgreSQL-first XML mapper runtime backed directly by asyncpg. The package is
-framework-neutral: it does not import FastAPI, a host application's settings,
-logging formatter, schema, or business models.
+A lightweight asynchronous XML mapper for Python. It keeps SQL out of business code —
+queries live in XML, Python keeps only the signature — so a service method reads as what
+the business does, not as string assembly around a cursor.
+
+PostgreSQL-first, backed directly by asyncpg. The package is framework-neutral: it does
+not import FastAPI, a host application's settings, logging formatter, schema, or business
+models.
 
 ## Installation
 
 ```bash
-pip install "git+https://github.com/z77777777777/python-mapper.git@v0.3.0"
+pip install python-mapper
 ```
 
 Requires Python 3.12+. The only runtime dependencies are `asyncpg` and `Jinja2`.
+
+## Async only
+
+Every execution path is asynchronous. Mapper calls, `query()` and `scalar()` return
+coroutines, and `transactional()` raises `TypeError` at decoration time if handed a
+synchronous function. This is not an omission — the driver underneath is asyncpg, which
+has no synchronous API at all.
+
+To use it from a synchronous framework (Flask, a classic Django view, a script), run one
+long-lived event loop in a background thread and submit work to it:
+
+```python
+import asyncio
+import threading
+
+loop = asyncio.new_event_loop()
+threading.Thread(target=loop.run_forever, daemon=True).start()
+
+# Open the pool once, on that loop.
+asyncio.run_coroutine_threadsafe(open_database(...), loop).result()
+
+# Then, from synchronous code:
+rows = asyncio.run_coroutine_threadsafe(
+    OrdersMapper.find(order_id=1), loop,
+).result()
+```
+
+Do **not** wrap individual calls in `asyncio.run()`. That builds a fresh event loop every
+time, while an asyncpg pool stays bound to the loop that created it — you would either hit
+"attached to a different loop" errors or rebuild the pool on every request.
 
 ## Package layout
 
