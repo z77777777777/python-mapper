@@ -1,6 +1,9 @@
 .pytest_cache/
 build/
 dist/
+# 拆成独立仓之后主仓的 .gitignore 不再兜底, 这行必须自带 ——
+# 包目录下已经有一个 .venv, 漏了它第一次提交就把整个虚拟环境推上去
+.venv/
 src/*.egg-info/
 **/__pycache__/
 *.py[cod]
