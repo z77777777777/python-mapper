@@ -4,8 +4,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
-from cyt_pymapper import runtime
-from cyt_pymapper.base import (
+from python_mapper import runtime
+from python_mapper.base import (
     MapperBase,
     bind_connection,
     current_connection,
@@ -13,7 +13,7 @@ from cyt_pymapper.base import (
     transactional,
     transactional_scope,
 )
-from cyt_pymapper.database import (
+from python_mapper.database import (
     ConnectionLike,
     PoolLike,
     acquire_raw_connection,
@@ -24,15 +24,15 @@ from cyt_pymapper.database import (
     open_database,
     ping_database,
 )
-from cyt_pymapper.errors import (
+from python_mapper.errors import (
     PaginationConflictError,
     PaginationError,
     PyMapperError,
     TooManyResultsError,
 )
-from cyt_pymapper.extension import MapperStartupState, PyMapperExtension
-from cyt_pymapper.observability import SqlLoggingPlugin
-from cyt_pymapper.pagination import (
+from python_mapper.extension import MapperStartupState, PyMapperExtension
+from python_mapper.observability import SqlLoggingPlugin
+from python_mapper.pagination import (
     DEFAULT_PAGE_SIZE,
     MAX_PAGE_SIZE,
     Page,
@@ -40,13 +40,13 @@ from cyt_pymapper.pagination import (
     PaginationOptions,
     QueryResult,
 )
-from cyt_pymapper.plugins import (
+from python_mapper.plugins import (
     StatementContext,
     StatementExecutor,
     StatementPlugin,
     StatementResult,
 )
-from cyt_pymapper.runtime import (
+from python_mapper.runtime import (
     AMapper,
     amapper,
     configure_mapper_paths,

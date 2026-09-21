@@ -1,0 +1,32 @@
+# 这份 workflow 服务的是**独立仓** z77777777777/python-mapper。
+#
+# 它放在包目录里、而不是主仓的 .github/workflows/ 下, 是因为 GitHub 只认仓库根的
+# workflow: 在 CYT-Buyer 里它处于 backend/packages/python-mapper/.github/ , 不会被触发;
+# 经 git subtree split 拆出去之后它正好落到新仓根部, 自动生效。
+# 主仓那份跑同一批测试, 见 .github/workflows/python-mapper.yml(带路径过滤)。
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  package-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12", "3.13", "3.14"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install package and test dependencies
+        run: python -m pip install -e ".[test]"
+      - name: Run package tests
+        run: python -m pytest -q

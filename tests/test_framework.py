@@ -13,7 +13,7 @@ import logging
 from dataclasses import dataclass
 
 import pytest
-from cyt_pymapper import (
+from python_mapper import (
     Page,
     PaginationConflictError,
     PaginationError,
@@ -34,16 +34,16 @@ from cyt_pymapper import (
     runtime,
     transactional,
 )
-from cyt_pymapper import mapping as result_mapping
-from cyt_pymapper.compiler import (
+from python_mapper import mapping as result_mapping
+from python_mapper.compiler import (
     compile_query,
     contains_top_level_keyword,
     named_parameter_names,
     positional_parameter_numbers,
     sql_token_parenthesis_depths,
 )
-from cyt_pymapper.errors import TooManyResultsError as ErrorsModuleTooManyResultsError
-from cyt_pymapper.runtime import _reject_interpolation
+from python_mapper.errors import TooManyResultsError as ErrorsModuleTooManyResultsError
+from python_mapper.runtime import _reject_interpolation
 
 # 快照/还原要覆盖的全部注册表 —— 与 reset_state 清的范围一致。
 # fixture 用"快照→reset→跑→reset→还原"而不是清空了事: 这样本测试文件可以混在
@@ -219,7 +219,7 @@ async def test_extension_scans_mapper_packages_and_starts_ready(tmp_path, monkey
     package_dir.mkdir()
     (package_dir / "__init__.py").write_text("", encoding="utf-8")
     (package_dir / "orders_mapper.py").write_text(
-        "from cyt_pymapper import amapper\n"
+        "from python_mapper import amapper\n"
         "@amapper()\n"
         "class OrdersMapper:\n"
         "    async def update(*, value: str | None = None) -> int: ...\n",
@@ -719,7 +719,7 @@ async def test_unpaged_calls_remove_internal_page_marker_without_paginating(tmp_
     assert disabled_result.pagination is None
     assert len(connection.executions) == 2
     for statement, _ in connection.executions:
-        assert "CYT_PYMAPPER_PAGE" not in statement
+        assert "PYTHON_MAPPER_PAGE" not in statement
         assert "LIMIT" not in statement and "OFFSET" not in statement
         assert statement.rstrip().endswith("FOR UPDATE")
 
@@ -1153,11 +1153,11 @@ async def test_sql_logging_plugin_records_shape_without_parameter_values(tmp_pat
         plugins=[SqlLoggingPlugin(slow_query_threshold_ms=0)],
     )
 
-    with caplog.at_level(logging.WARNING, logger="cyt_pymapper.query"):
+    with caplog.at_level(logging.WARNING, logger="python_mapper.query"):
         async with bind_connection(connection):
             await LoggingMapper.list_rows(secret="do-not-log-this")
 
-    record = next(record for record in caplog.records if record.name == "cyt_pymapper.query")
+    record = next(record for record in caplog.records if record.name == "python_mapper.query")
     event = record.pymapper
     assert event["statement_id"] == f"{namespace}.list_rows"
     assert event["parameter_names"] == ["secret"]
@@ -1194,12 +1194,12 @@ async def test_sql_logging_plugin_keeps_traceback_and_error_type(tmp_path, caplo
         plugins=[SqlLoggingPlugin()],
     )
 
-    with caplog.at_level(logging.ERROR, logger="cyt_pymapper.query"):
+    with caplog.at_level(logging.ERROR, logger="python_mapper.query"):
         with pytest.raises(RuntimeError, match="database unavailable"):
             async with bind_connection(FailingConnection()):
                 await FailingLoggingMapper.list_rows(secret="do-not-log-this")
 
-    record = next(record for record in caplog.records if record.name == "cyt_pymapper.query")
+    record = next(record for record in caplog.records if record.name == "python_mapper.query")
     assert record.exc_info is not None
     assert record.pymapper["error_type"] == "RuntimeError"
     assert "do-not-log-this" not in json.dumps(record.pymapper)
@@ -1615,7 +1615,7 @@ def test_postgres_cast_and_time_literal_not_treated_as_param(tmp_path):
 
 
 def test_amapper_enhancer_inherits_mapper_base():
-    from cyt_pymapper import AMapper, MapperBase
+    from python_mapper import AMapper, MapperBase
     assert issubclass(AMapper, MapperBase)
     assert amapper is AMapper
 

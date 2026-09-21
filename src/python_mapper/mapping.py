@@ -8,7 +8,7 @@ from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from cyt_pymapper.errors import TooManyResultsError
+from python_mapper.errors import TooManyResultsError
 
 
 class ResultSpec(NamedTuple):

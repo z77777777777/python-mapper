@@ -5,16 +5,16 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from cyt_pymapper.compiler import (
+from python_mapper.compiler import (
     contains_top_level_keyword,
     contains_top_level_sequence,
 )
-from cyt_pymapper.errors import PaginationConflictError, PaginationError
-from cyt_pymapper.plugins import StatementContext, StatementExecutor, StatementResult
+from python_mapper.errors import PaginationConflictError, PaginationError
+from python_mapper.plugins import StatementContext, StatementExecutor, StatementResult
 
 DEFAULT_PAGE_SIZE = 30
 MAX_PAGE_SIZE = 200
-PAGE_MARKER = "/*__CYT_PYMAPPER_PAGE__*/"
+PAGE_MARKER = "/*__PYTHON_MAPPER_PAGE__*/"
 PAGE_LIMIT_PARAMETER = "__page_size"
 PAGE_OFFSET_PARAMETER = "__page_offset"
 

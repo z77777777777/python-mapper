@@ -1,8 +1,18 @@
-# cyt-pymapper
+# python-mapper
+
+[English](README.md) · [简体中文](README.zh-CN.md)
 
 PostgreSQL-first XML mapper runtime backed directly by asyncpg. The package is
 framework-neutral: it does not import FastAPI, a host application's settings,
 logging formatter, schema, or business models.
+
+## Installation
+
+```bash
+pip install "git+https://github.com/z77777777777/python-mapper.git@v0.3.0"
+```
+
+Requires Python 3.12+. The only runtime dependencies are `asyncpg` and `Jinja2`.
 
 ## Package layout
 
@@ -26,12 +36,12 @@ imports and shared global state spread across several files.
 
 ## Application setup
 
-推荐使用扩展完成一次性接线：
+Wire everything once through the extension:
 
 ```python
 from pathlib import Path
 
-from cyt_pymapper import PyMapperExtension, SqlLoggingPlugin
+from python_mapper import PyMapperExtension, SqlLoggingPlugin
 
 pymapper = PyMapperExtension(
     database_url="postgresql://user:password@localhost/database",
@@ -40,21 +50,23 @@ pymapper = PyMapperExtension(
     plugins=[SqlLoggingPlugin(slow_query_threshold_ms=500)],
 )
 
-# 把这个生命周期嵌入 FastAPI、Starlette、CLI worker 或自有宿主。
+# Embed this lifespan in FastAPI, Starlette, a CLI worker, or your own host.
 async def run_application() -> None:
     async with pymapper.lifespan() as state:
         print(state.statement_count)
         await serve_application()
 ```
 
-扩展会自动导入 `mapper_packages` 下的全部模块、加载 XML、执行启动期契约校验、
-打开连接池并在退出时关闭。需要底层接线时仍可使用 `configure()`、
-`load_all_mappers()` 和 `open_database()`。测试隔离用 `reset_state()`，不要手动清注册表。
+The extension imports every module under `mapper_packages`, loads the XML, runs
+startup-time contract validation, opens the pool, and closes it on exit. Lower-level
+wiring remains available through `configure()`, `load_all_mappers()` and
+`open_database()`. Use `reset_state()` for test isolation instead of clearing the
+registry by hand.
 
 ## Mapper declaration
 
 ```python
-from cyt_pymapper import amapper, transactional
+from python_mapper import amapper, transactional
 
 @amapper()
 class OrdersMapper:
@@ -71,8 +83,9 @@ async def update_order(order_id: int) -> None:
 Mapper methods do not accept a connection. A direct mapper call borrows one connection
 without opening an explicit transaction; PostgreSQL commits that statement as its own
 transaction. Calls inside `@transactional()` reuse the task-local connection and commit or
-roll back together. `REQUIRED` and `REQUIRES_NEW` propagation are supported;
-`REQUIRED` 加入即继承外层事务的隔离级别(与 Spring/MyBatis 同语义)。
+roll back together. `REQUIRED` and `REQUIRES_NEW` propagation are supported; a `REQUIRED`
+participant inherits the outer transaction's isolation level, matching Spring/MyBatis
+semantics.
 
 Jinja blocks may control SQL structure, but values must use named binds
 such as `:order_id`. `{{ value }}` interpolation is rejected while loading XML.
@@ -82,23 +95,27 @@ are also rejected because XML statements use one binding contract: `:name`.
 
 ## Result mapping
 
-- `resultType="module.Row"` 使用同名自动映射：只传入模型声明过的构造字段，SQL
-  多返回的列直接忽略，未返回的可选字段使用模型默认值。
-- `resultMap="rowMap"` 允许显式声明 `column -> property`；显式 property 在模型中
-  不存在时，`load_all_mappers()` 启动校验直接失败。
-- 所有 `resultType` 路径在全量 XML 加载完成后统一验证，路径拼错不会拖到首次查询。
-- `single="true"` 是严格的 0..1 行契约：0 行返回 `None`，1 行返回单对象，
-  多于 1 行抛出 `TooManyResultsError`，不会静默取第一行。
+- `resultType="module.Row"` maps by matching names: only fields the model declares as
+  constructor arguments are passed in. Extra columns returned by the SQL are ignored, and
+  optional fields the query did not return fall back to the model's defaults.
+- `resultMap="rowMap"` declares `column -> property` explicitly. If an explicit property
+  does not exist on the model, `load_all_mappers()` fails during startup validation.
+- Every `resultType` path is validated after all XML has loaded, so a typo in a dotted
+  path surfaces at startup rather than on the first query.
+- `single="true"` is a strict 0..1 row contract: zero rows return `None`, one row returns
+  the object, and more than one raises `TooManyResultsError` — it never silently takes the
+  first row.
 
-框架异常定义在 `cyt_pymapper.errors`，业务代码可统一从包根导入：
+Framework exceptions live in `python_mapper.errors` and are re-exported from the package
+root:
 
 ```python
-from cyt_pymapper import PyMapperError, TooManyResultsError
+from python_mapper import PyMapperError, TooManyResultsError
 ```
 
 ## Optional pagination
 
-分页是显式、可插拔能力。普通 Mapper 调用永远不自动加工 SQL：
+Pagination is explicit and opt-in. A plain mapper call never rewrites your SQL:
 
 ```xml
 <select id="list_orders" countRef="count_orders" resultType="app.types.OrderRow">
@@ -114,7 +131,7 @@ from cyt_pymapper import PyMapperError, TooManyResultsError
 ```
 
 ```python
-from cyt_pymapper import Page
+from python_mapper import Page
 
 class OrdersMapper:
     async def list_orders(
@@ -127,60 +144,73 @@ page_result = await OrdersMapper.list_orders(
 )
 ```
 
-返回注解为 `Page[T]` 时，Mapper 调用直接返回与 Web 框架无关的成品分页对象，
-字段固定为 `items / total / page / page_size / pages`。框架把 SQL 返回的
-`list[T]` 放入 `Page`，调用方不接触 `PaginationOptions`、`QueryResult` 或
-`PageMetadata`。不分页的方法继续声明并返回 `list[T]`。
+When the return annotation is `Page[T]`, the mapper call returns a finished, web-framework
+agnostic page object whose fields are fixed as `items / total / page / page_size / pages`.
+The framework puts the `list[T]` returned by the SQL into the `Page`; callers never touch
+`PaginationOptions`, `QueryResult` or `PageMetadata`. Methods that do not paginate keep
+declaring and returning `list[T]`.
 
-`query(..., pagination=PaginationOptions(...))` 仅保留为低层入口，用于动态关闭
-分页或 `include_total=False` 的 slice/`has_next` 场景。
+`query(..., pagination=PaginationOptions(...))` remains as a low-level entry point, for
+dynamically disabling pagination or for slice/`has_next` cases with `include_total=False`.
 
-- 不配置 `page_size` 时默认 30，最大 200。
-- `enabled=False` 时不添加分页子句、不 count；若 XML 声明了 `<page/>`，只移除
-  这个内部插入标记后执行未分页 SQL。
-- 开启分页时必须有稳定的顶层 `ORDER BY`。
-- `include_total=True` 需要显式 `countRef`；设为 `False` 时通过多取一行判断
-  `has_next`，不执行 count。
-- 不写 `<page/>` 时分页子句追加到 SQL 末尾；`FOR UPDATE` 等需要指定插入位置时
-  使用 `<page/>`。标记必须位于完整的顶层 `ORDER BY` 子句之后、可选的 `FOR`
-  锁定子句之前，不能放进 SELECT 列、WHERE、子查询、字符串或注释。
-- 手写顶层 `LIMIT/OFFSET/FETCH` 与开启的框架分页冲突；关闭框架分页时手写分页
-  完全保留。`<page/>` 与手写分页同时出现会在 XML 加载期失败。
-- 该能力提供页码式 `LIMIT/OFFSET` 分页；百万级深翻页应关闭插件，在业务 Mapper
-  中显式实现基于稳定排序键的游标分页，框架不会猜测宿主的业务游标。
+- `page_size` defaults to 30 and is capped at 200.
+- With `enabled=False` no pagination clause is added and no count runs; if the XML
+  declares `<page/>`, only that internal marker is removed before executing the
+  unpaginated SQL.
+- A stable top-level `ORDER BY` is required whenever pagination is enabled.
+- `include_total=True` requires an explicit `countRef`. With `False`, `has_next` is
+  determined by fetching one extra row and no count is executed.
+- Without `<page/>` the pagination clause is appended at the end of the SQL. Use `<page/>`
+  when the insertion point matters, for example with `FOR UPDATE`. The marker must sit
+  after a complete top-level `ORDER BY` and before any `FOR` locking clause — never inside
+  select columns, a `WHERE`, a subquery, a string, or a comment.
+- A hand-written top-level `LIMIT/OFFSET/FETCH` conflicts with enabled framework
+  pagination; with framework pagination disabled, hand-written pagination is preserved
+  exactly. Declaring `<page/>` together with hand-written pagination fails at XML load
+  time.
+- This feature provides page-number `LIMIT/OFFSET` pagination. For deep paging over
+  millions of rows, disable it and implement keyset (cursor) pagination explicitly in your
+  own mapper — the framework will not guess your business cursor.
 
 ## SQL execution plugins and logging
 
-宿主通过 `plugins=[...]` 配置执行插件。插件只依赖 `StatementContext`、
-`StatementResult` 和 `StatementPlugin`，可用于指标、追踪、审计或只读保护，不依赖
-具体 Web 框架。
+Hosts configure execution plugins through `plugins=[...]`. A plugin depends only on
+`StatementContext`, `StatementResult` and `StatementPlugin`, so it can serve metrics,
+tracing, auditing or read-only protection without depending on any web framework.
 
-`SqlLoggingPlugin` 默认输出结构化 `LogRecord.pymapper`：statement id、最终 asyncpg
-SQL、SQL fingerprint、耗时、连接等待、行数、参数名称和参数类型。它不记录参数值；
-异常使用 `logger.exception` 保留 traceback。宿主可在自己的 JSON formatter 中把
-`record.pymapper` 放进日志载荷。
+`SqlLoggingPlugin` emits a structured `LogRecord.pymapper` by default: statement id, final
+asyncpg SQL, SQL fingerprint, elapsed time, connection wait, row count, parameter names
+and parameter types. It never logs parameter values, and exceptions go through
+`logger.exception` so the traceback is preserved. A host can lift `record.pymapper` into
+its own JSON formatter payload.
 
-插件实例是进程级配置，可能被并发请求复用。自定义插件必须保持无状态，或自行保护
-可变状态。
+Plugin instances are process-level configuration and may be reused across concurrent
+requests. Custom plugins must be stateless, or guard their own mutable state.
 
-## 已知坑(写代码前读一遍)
+## Known pitfalls (read before writing code)
 
-- **空集合 expanding 绑参静默匹配零行**: `IN :ids` 传空 list 时, pymapper 渲染成
-  "空集"表达式 —— 不报错、匹配不到任何行。`NOT IN :ids` 传空同理会**排除不了任何行
-  之外的东西**(即全部通过)。集合可能为空时, 调用方自己分支或给参数设不可省略的默认。
-- **结果集全量物化**: mapper 调用把整个结果集一次拉进内存再做行映射。大集合一律
-  LIMIT/分页, 不要指望流式 —— 框架刻意不提供(避免把游标生命周期泄给调用方)。
-- **事务范围内禁止 `asyncio.create_task` 调 mapper**: 子任务会并发使用同一个连接
-  (asyncpg 直接报错)或使用已释放的连接。见 `transactional` docstring。
-- **`:name::type` 写法加载期即拒**: 改写 `CAST(:name AS type)`。
+- **An empty expanding bind silently matches zero rows.** Passing an empty list to
+  `IN :ids` renders an "empty set" expression — no error, no matching rows. `NOT IN :ids`
+  with an empty list behaves the same way in reverse: nothing is excluded, so everything
+  passes. When a collection can legitimately be empty, branch in the caller or give the
+  parameter a non-optional default.
+- **Result sets are fully materialized.** A mapper call pulls the whole result set into
+  memory before mapping rows. Always paginate or `LIMIT` large sets; streaming is
+  deliberately not offered, so that a cursor's lifetime is never leaked to the caller.
+- **Never call a mapper from `asyncio.create_task` inside a transaction.** The child task
+  would either use the same connection concurrently (asyncpg raises) or use a connection
+  that has already been released. See the `transactional` docstring.
+- **`:name::type` is rejected at load time.** Write `CAST(:name AS type)` instead.
 
 ## Tests
 
 ```bash
 pip install -e ".[test]"
-pytest packages/cyt-pymapper/tests
+pytest
 ```
 
-包测试的 fixture 是快照/还原式, 可以混在宿主项目的 CI 里跑, 不污染宿主 mapper 状态。
-仓库 CI 会在 Windows/Linux 与 Python 3.12/3.13/3.14 上独立运行包测试；
-任何宿主业务库或 Web 框架都不参与这个矩阵。
+The package's test fixtures snapshot and restore global state, so they can run alongside a
+host project's own suite without polluting the host's mapper registry.
+
+CI runs the suite on Windows and Linux across Python 3.12 / 3.13 / 3.14. No host
+application, business database or web framework takes part in that matrix.

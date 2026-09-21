@@ -7,7 +7,7 @@ import logging
 import time
 from typing import Any
 
-from cyt_pymapper.plugins import StatementContext, StatementExecutor, StatementResult
+from python_mapper.plugins import StatementContext, StatementExecutor, StatementResult
 
 
 def _normalized_sql(sql: str) -> str:
@@ -25,7 +25,7 @@ class SqlLoggingPlugin:
         self,
         *,
         slow_query_threshold_ms: float = 500.0,
-        logger_name: str = "cyt_pymapper.query",
+        logger_name: str = "python_mapper.query",
         include_sql: bool = True,
     ) -> None:
         if slow_query_threshold_ms < 0:

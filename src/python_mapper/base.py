@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar, Token
 from typing import ParamSpec, TypeVar
 
-from cyt_pymapper.database import ConnectionLike, acquire_raw_connection
+from python_mapper.database import ConnectionLike, acquire_raw_connection
 
 CallableParameters = ParamSpec("CallableParameters")
 ReturnValue = TypeVar("ReturnValue")

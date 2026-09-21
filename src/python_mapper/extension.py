@@ -11,7 +11,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from cyt_pymapper.database import (
+from python_mapper.database import (
     PoolLike,
     close_database,
     configure_database,
@@ -19,8 +19,8 @@ from cyt_pymapper.database import (
     open_database,
     ping_database,
 )
-from cyt_pymapper.plugins import StatementPlugin
-from cyt_pymapper.runtime import configure_mapper_paths, configure_plugins, load_all_mappers
+from python_mapper.plugins import StatementPlugin
+from python_mapper.runtime import configure_mapper_paths, configure_plugins, load_all_mappers
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +52,7 @@ def _import_mapper_package(package_ref: str | ModuleType) -> tuple[str, ...]:
 
 
 class PyMapperExtension:
-    """Configure cyt-pymapper once and own its application lifecycle.
+    """Configure python-mapper once and own its application lifecycle.
 
     Construction only records configuration; it never performs network I/O.
     ``lifespan()`` imports every configured mapper package, validates all XML,
@@ -116,7 +116,7 @@ class PyMapperExtension:
             database_ready = await ping_database()
             return MapperStartupState(statement_count, database_ready)
         except Exception as error:
-            logger.exception("cyt-pymapper database startup failed")
+            logger.exception("python-mapper database startup failed")
             if require_database:
                 raise
             return MapperStartupState(statement_count, False, error)

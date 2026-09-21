@@ -1,4 +1,4 @@
-"""asyncpg pool lifecycle owned by cyt-pymapper."""
+"""asyncpg pool lifecycle owned by python-mapper."""
 from __future__ import annotations
 
 import asyncio
@@ -103,7 +103,7 @@ def configure_database(
 ) -> None:
     """Register pool settings. Network connections are opened by ``open_database``."""
     if _POOL is not None:
-        raise RuntimeError("cannot reconfigure cyt-pymapper while its database pool is open")
+        raise RuntimeError("cannot reconfigure python-mapper while its database pool is open")
     if not dsn.strip():
         raise ValueError("database dsn must not be empty")
     if min_size < 0 or max_size < 1 or min_size > max_size:
@@ -127,7 +127,7 @@ def configure_pool(pool: PoolLike) -> None:
     if _POOL is pool:
         return
     if _POOL is not None:
-        raise RuntimeError("cyt-pymapper database pool is already configured")
+        raise RuntimeError("python-mapper database pool is already configured")
     _POOL = pool
     _POOL_OWNED = False
 
@@ -139,7 +139,7 @@ async def open_database() -> PoolLike:
         return _POOL
     config = _DATABASE_CONFIG
     if config is None:
-        raise RuntimeError("cyt-pymapper database is not configured")
+        raise RuntimeError("python-mapper database is not configured")
     created = await _POOL_FACTORY(
         dsn=config.dsn,
         min_size=config.min_size,
@@ -157,7 +157,7 @@ async def open_database() -> PoolLike:
 def get_pool() -> PoolLike:
     """Return the active pool or fail before any SQL is attempted."""
     if _POOL is None:
-        raise RuntimeError("cyt-pymapper database pool is not open; call open_database() at startup")
+        raise RuntimeError("python-mapper database pool is not open; call open_database() at startup")
     return _POOL
 
 

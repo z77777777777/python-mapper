@@ -1,6 +1,6 @@
 """XML mapper execution runtime backed directly by asyncpg.
 
-对外 API 从 `cyt_pymapper` 导入(本模块是实现)。
+对外 API 从 `python_mapper` 导入(本模块是实现)。
 
 XML keeps readable ``:name`` parameters. They are compiled to asyncpg ``$1``
 parameters after Jinja has selected SQL structure. Collection parameters retain
@@ -21,9 +21,9 @@ from typing import Any, TypeVar, cast, get_origin, get_type_hints
 
 from jinja2 import Environment, Template, meta, nodes
 
-from cyt_pymapper import mapping as result_mapping
-from cyt_pymapper.base import MapperBase
-from cyt_pymapper.compiler import (
+from python_mapper import mapping as result_mapping
+from python_mapper.base import MapperBase
+from python_mapper.compiler import (
     compile_query,
     contains_sql_keyword,
     contains_top_level_keyword,
@@ -32,9 +32,9 @@ from cyt_pymapper.compiler import (
     sql_token_parenthesis_depths,
     top_level_sql_word_positions,
 )
-from cyt_pymapper.database import ConnectionLike
-from cyt_pymapper.errors import PaginationConflictError
-from cyt_pymapper.pagination import (
+from python_mapper.database import ConnectionLike
+from python_mapper.errors import PaginationConflictError
+from python_mapper.pagination import (
     PAGE_MARKER,
     Page,
     PageMetadata,
@@ -43,7 +43,7 @@ from cyt_pymapper.pagination import (
     PaginationSpec,
     QueryResult,
 )
-from cyt_pymapper.plugins import (
+from python_mapper.plugins import (
     StatementContext,
     StatementPlugin,
     StatementResult,
@@ -137,7 +137,7 @@ def load_all_mappers() -> int:
             return len(_SQL_CONTAINER)
         if not _MAPPER_PATHS:
             raise RuntimeError(
-                "cyt-pymapper is not configured: call configure(database_url=..., mapper_paths=...)"
+                "python-mapper is not configured: call configure(database_url=..., mapper_paths=...)"
             )
         _clear_loaded_sql()
         try:

@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cyt-pymapper"
+name = "python-mapper"
 version = "0.3.0"
 description = "PostgreSQL XML mapper with asyncpg pooling and implicit transactions"
 readme = "README.md"
@@ -26,7 +26,7 @@ where = ["src"]
 # py.typed 必须随 wheel 分发: 缺了它, 消费项目的 pyright/mypy 视本包为无类型,
 # 全部导出退化成 Unknown；源码路径直连的宿主通常感知不到这个打包缺陷。
 [tool.setuptools.package-data]
-cyt_pymapper = ["py.typed"]
+python_mapper = ["py.typed"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

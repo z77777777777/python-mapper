@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from cyt_pymapper.database import ConnectionLike
+from python_mapper.database import ConnectionLike
 
 
 @dataclass(slots=True)
