@@ -1,6 +1,7 @@
 # python-mapper
 
-[English](README.md) · [简体中文](README.zh-CN.md)
+[English](https://github.com/z77777777777/python-mapper/blob/main/README.md) ·
+[简体中文](https://github.com/z77777777777/python-mapper/blob/main/README.zh-CN.md)
 
 A lightweight asynchronous XML mapper for Python. It keeps SQL out of business code —
 queries live in XML, Python keeps only the signature — so a service method reads as what

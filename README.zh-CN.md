@@ -1,6 +1,7 @@
 # python-mapper
 
-[English](README.md) · [简体中文](README.zh-CN.md)
+[English](https://github.com/z77777777777/python-mapper/blob/main/README.md) ·
+[简体中文](https://github.com/z77777777777/python-mapper/blob/main/README.zh-CN.md)
 
 一款轻量的 Python 异步 XML 映射工具，把 SQL 从业务代码里解离出来——查询写在 XML 里，
 Python 侧只留签名，于是一个 service 方法读起来就是业务本身，而不是绕着游标拼字符串。
